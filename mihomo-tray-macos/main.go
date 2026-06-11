@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"archive/zip"
@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,6 +33,14 @@ var offPng []byte
 //go:embed warn.png
 var warnPng []byte
 
+const (
+	statusRefreshInterval  = 2 * time.Second
+	proxyGuardInterval     = 30 * time.Second
+	runningCacheTTL        = 5 * time.Second
+	proxyStateCacheTTL     = 5 * time.Second
+	networkServiceCacheTTL = 5 * time.Minute
+)
+
 var (
 	baseDir       string
 	configPath    string
@@ -43,18 +52,60 @@ var (
 	panelPort     = 9097
 	panelPath     = "ui"
 	runOnStart    = false
+	lastTunOn     = false
+
+	systemProxyDesired      = false
+	systemProxyGuardEnabled = true
+	trayConfigHasTunState   = false
 
 	subs     []SubInfo
 	profiles []ConfigProfile
 
 	mihomoCmd *exec.Cmd
 
+	httpClient = &http.Client{Timeout: 30 * time.Second}
+
+	activeConfigCache configFileCache
+
+	runningCacheValue bool
+	runningCacheAt    time.Time
+
+	proxyStateCacheEnabled bool
+	proxyStateCacheTarget  string
+	proxyStateCacheAt      time.Time
+
+	networkServiceCacheValue string
+	networkServiceCacheAt    time.Time
+
+	mStatus     *systray.MenuItem
 	mStartStop  *systray.MenuItem
 	mTun        *systray.MenuItem
 	mProxy      *systray.MenuItem
+	mProxyGuard *systray.MenuItem
 	mAutoStart  *systray.MenuItem
 	mRunOnStart *systray.MenuItem
 )
+
+var mihomoProcessNames = []string{"mihomo", "mihomo-alpha", "clash-meta", "Clash.Meta"}
+
+var (
+	tunStatusRe          = regexp.MustCompile(`(?m)(^tun:\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]+enable:\s*)(true|false)`)
+	httpPortRe           = regexp.MustCompile(`(?m)^port:\s*(\d+)`)
+	base64CandidateRe    = regexp.MustCompile(`^[A-Za-z0-9+/]+=*$`)
+	apiMessageRe         = regexp.MustCompile(`"message"\s*:\s*"([^"]+)"`)
+	browserDownloadURLRe = regexp.MustCompile(`"browser_download_url"\s*:\s*"([^"]+)"`)
+)
+
+var tunConflictTargets = []tunConflictTarget{
+	{DisplayName: "ZeroTier", Tokens: []string{"zerotier", "zero tier"}, CanStop: true},
+	{DisplayName: "Tailscale", Tokens: []string{"tailscale", "tailscaled"}, CanStop: true},
+	{DisplayName: "NetEase UU Booster", Tokens: []string{"uu booster", "uubooster", "netease uu"}, CanStop: true},
+	{DisplayName: "Leigod Accelerator", Tokens: []string{"leigod", "leishen"}, CanStop: true},
+	{DisplayName: "XunYou Accelerator", Tokens: []string{"xunyou"}, CanStop: true},
+	{DisplayName: "QiYou Accelerator", Tokens: []string{"qiyou"}, CanStop: true},
+	{DisplayName: "Netpas Accelerator", Tokens: []string{"netpas"}, CanStop: true},
+	{DisplayName: "Generic Game Booster", Tokens: []string{"booster", "accelerator"}, CanStop: true},
+}
 
 type SubInfo struct {
 	Name string `json:"name"`
@@ -67,17 +118,40 @@ type ConfigProfile struct {
 }
 
 type TrayConfig struct {
-	Panel              panelConfig     `json:"panel"`
-	Profiles           []ConfigProfile `json:"profiles"`
-	ActiveConfigPath   string          `json:"activeConfigPath"`
-	RunMihomoOnStartup bool            `json:"runMihomoOnStartup"`
-	Subscriptions      []SubInfo       `json:"subscriptions"`
+	Panel                   panelConfig     `json:"panel"`
+	Profiles                []ConfigProfile `json:"profiles"`
+	ActiveConfigPath        string          `json:"activeConfigPath"`
+	RunMihomoOnStartup      bool            `json:"runMihomoOnStartup"`
+	LastTunEnabled          bool            `json:"lastTunEnabled"`
+	SystemProxyDesired      bool            `json:"systemProxyDesired"`
+	SystemProxyGuardEnabled bool            `json:"systemProxyGuardEnabled"`
+	Subscriptions           []SubInfo       `json:"subscriptions"`
 }
 
 type panelConfig struct {
 	Host string `json:"host"`
 	Port int    `json:"port"`
 	Path string `json:"path"`
+}
+
+type configFileCache struct {
+	path    string
+	modTime time.Time
+	size    int64
+	data    []byte
+}
+
+type tunConflictTarget struct {
+	DisplayName string
+	Tokens      []string
+	CanStop     bool
+}
+
+type tunConflictInfo struct {
+	DisplayName string
+	ProcessID   string
+	Command     string
+	CanStop     bool
 }
 
 func main() {
@@ -101,6 +175,7 @@ func main() {
 
 	loadTrayConfig()
 	resolveActiveConfig()
+	applySavedTunStatus()
 
 	systray.Run(onReady, onExit)
 }
@@ -110,7 +185,11 @@ func onReady() {
 	systray.SetTitle("")
 	systray.SetTooltip("Mihomo - Stopped")
 
-	mStartStop = systray.AddMenuItem("Start Mihomo", "")
+	mStatus = systray.AddMenuItem("Mihomo - Stopped", "")
+	mStatus.Disable()
+	systray.AddSeparator()
+
+	mStartStop = systray.AddMenuItem("Start Mihomo", "Start or stop the mihomo core")
 	go func() {
 		for range mStartStop.ClickedCh {
 			if isRunning() {
@@ -124,28 +203,35 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mTun = systray.AddMenuItemCheckbox("TUN Mode", "", readTunStatus())
+	mTun = systray.AddMenuItemCheckbox("TUN Mode", "Route traffic through mihomo TUN mode", readTunStatus())
 	go func() {
 		for range mTun.ClickedCh {
 			toggleTun()
 		}
 	}()
 
-	mProxy = systray.AddMenuItemCheckbox("System Proxy", "", isProxyEnabled())
+	mProxy = systray.AddMenuItemCheckbox("System Proxy", "Set macOS HTTP and HTTPS proxy to mihomo", systemProxyDesired)
 	go func() {
 		for range mProxy.ClickedCh {
 			toggleSystemProxy()
 		}
 	}()
 
-	mDash := systray.AddMenuItem("Open Dashboard", "")
+	mProxyGuard = systray.AddMenuItemCheckbox("Proxy Guard", "Every 30 seconds, restore the system proxy if another app changes it", systemProxyGuardEnabled)
+	go func() {
+		for range mProxyGuard.ClickedCh {
+			toggleProxyGuard()
+		}
+	}()
+
+	mDash := systray.AddMenuItem("Open Dashboard", "Open the Mihomo dashboard in your browser")
 	go func() {
 		for range mDash.ClickedCh {
 			exec.Command("open", buildPanelUrl()).Start()
 		}
 	}()
 
-	mPanelSet := systray.AddMenuItem("Panel Settings", "")
+	mPanelSet := systray.AddMenuItem("Panel Settings", "Change dashboard host, port, and path")
 	go func() {
 		for range mPanelSet.ClickedCh {
 			openPanelSettings()
@@ -154,8 +240,8 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mSubMenu := systray.AddMenuItem("Update Subscription", "")
-	mSubAll := mSubMenu.AddSubMenuItem("Update All", "")
+	mSubMenu := systray.AddMenuItem("Subscriptions", "Update configured subscriptions")
+	mSubAll := mSubMenu.AddSubMenuItem("Update All", "Download and merge all subscriptions")
 	go func() {
 		for range mSubAll.ClickedCh {
 			for _, s := range subs {
@@ -165,7 +251,7 @@ func onReady() {
 	}()
 	rebuildSubMenu(mSubMenu)
 
-	mSubEdit := systray.AddMenuItem("Edit Subscriptions", "")
+	mSubEdit := systray.AddMenuItem("Edit Subscriptions", "Edit tray-config.json in TextEdit")
 	go func() {
 		for range mSubEdit.ClickedCh {
 			exec.Command("open", "-a", "TextEdit", trayCfgPath).Start()
@@ -174,7 +260,7 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mUpdate := systray.AddMenuItem("Update Components", "")
+	mUpdate := systray.AddMenuItem("Update Components", "Update mihomo core and rule data")
 	go func() {
 		for range mUpdate.ClickedCh {
 			updateAllComponents()
@@ -183,14 +269,14 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mRunOnStart = systray.AddMenuItemCheckbox("Run Mihomo on Startup", "", runOnStart)
+	mRunOnStart = systray.AddMenuItemCheckbox("Run Mihomo on Startup", "Start mihomo when MihomoTray launches", runOnStart)
 	go func() {
 		for range mRunOnStart.ClickedCh {
 			toggleRunOnStartup()
 		}
 	}()
 
-	mAutoStart = systray.AddMenuItemCheckbox("Auto Start", "", isAutoStartEnabled())
+	mAutoStart = systray.AddMenuItemCheckbox("Open MihomoTray at Login", "Register MihomoTray in LaunchAgents", isAutoStartEnabled())
 	go func() {
 		for range mAutoStart.ClickedCh {
 			toggleAutoStart()
@@ -199,7 +285,7 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mQuit := systray.AddMenuItem("Quit", "")
+	mQuit := systray.AddMenuItem("Quit", "Stop mihomo and quit MihomoTray")
 	go func() {
 		<-mQuit.ClickedCh
 		systray.Quit()
@@ -212,12 +298,23 @@ func onReady() {
 			refreshUI()
 		}()
 	}
+	if systemProxyDesired {
+		go ensureSystemProxy()
+	}
 
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(statusRefreshInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			refreshUI()
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(proxyGuardInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			ensureSystemProxy()
 		}
 	}()
 
@@ -226,8 +323,9 @@ func onReady() {
 
 func onExit() {
 	runOnStart = isRunning()
+	lastTunOn = readTunStatus()
 	saveTrayConfig()
-	if isProxyEnabled() {
+	if isMihomoSystemProxyActiveFresh() {
 		setSystemProxy(false)
 	}
 	killMihomo()
@@ -237,6 +335,7 @@ func refreshUI() {
 	running := isRunning()
 	tunOn := readTunStatus()
 	proxyOn := isProxyEnabled()
+	httpPort := readHTTPPort()
 
 	if running {
 		mStartStop.SetTitle("Stop Mihomo")
@@ -253,26 +352,40 @@ func refreshUI() {
 		} else {
 			systray.SetIcon(onPng)
 		}
+		mStatus.SetTitle(tip)
 	} else {
 		mStartStop.SetTitle("Start Mihomo")
 		systray.SetIcon(offPng)
 		systray.SetTooltip("Mihomo - Stopped")
+		mStatus.SetTitle("Mihomo - Stopped")
 	}
 
 	if tunOn {
 		mTun.Check()
-		mTun.SetTitle("TUN Mode (ON)")
+		mTun.SetTitle("TUN Mode: On")
 	} else {
 		mTun.Uncheck()
-		mTun.SetTitle("TUN Mode (OFF)")
+		mTun.SetTitle("TUN Mode: Off")
 	}
 
-	if proxyOn {
+	if systemProxyDesired {
 		mProxy.Check()
-		mProxy.SetTitle("System Proxy (ON)")
+		if proxyOn {
+			mProxy.SetTitle(fmt.Sprintf("System Proxy: On (localhost:%d)", httpPort))
+		} else {
+			mProxy.SetTitle(fmt.Sprintf("System Proxy: Restoring (localhost:%d)", httpPort))
+		}
 	} else {
 		mProxy.Uncheck()
-		mProxy.SetTitle("System Proxy (OFF)")
+		mProxy.SetTitle("System Proxy: Off")
+	}
+
+	if systemProxyGuardEnabled {
+		mProxyGuard.Check()
+		mProxyGuard.SetTitle("Proxy Guard: On")
+	} else {
+		mProxyGuard.Uncheck()
+		mProxyGuard.SetTitle("Proxy Guard: Off")
 	}
 
 	if isAutoStartEnabled() {
@@ -316,9 +429,11 @@ func startMihomo() {
 		notify("Start failed: " + err.Error())
 		return
 	}
+	invalidateRunningCache()
 	go func() {
 		mihomoCmd.Wait()
 		mihomoCmd = nil
+		invalidateRunningCache()
 	}()
 }
 
@@ -331,20 +446,41 @@ func killMihomo() {
 		mihomoCmd.Process.Kill()
 		mihomoCmd = nil
 	}
-	for _, n := range []string{"mihomo", "mihomo-alpha", "clash-meta", "Clash.Meta"} {
-		exec.Command("pkill", "-9", "-f", n).Run()
+	for _, n := range mihomoProcessNames {
+		exec.Command("pkill", "-TERM", "-x", n).Run()
+	}
+	time.Sleep(300 * time.Millisecond)
+	for _, n := range mihomoProcessNames {
+		exec.Command("pkill", "-KILL", "-x", n).Run()
 	}
 	time.Sleep(200 * time.Millisecond)
+	invalidateRunningCache()
 }
 
 func isRunning() bool {
+	if time.Since(runningCacheAt) < runningCacheTTL {
+		return runningCacheValue
+	}
+	runningCacheValue = isRunningFresh()
+	runningCacheAt = time.Now()
+	return runningCacheValue
+}
+
+func isRunningFresh() bool {
 	if mihomoCmd != nil && mihomoCmd.Process != nil {
 		return mihomoCmd.Process.Signal(syscall.Signal(0)) == nil
 	}
-	for _, n := range []string{"mihomo", "mihomo-alpha", "clash-meta", "Clash.Meta"} {
-		out, _ := exec.Command("pgrep", "-l", "-f", n).Output()
-		for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if l != "" && !strings.Contains(l, "mihomo-tray") {
+	out, _ := exec.Command("pgrep", "-lf", strings.Join(mihomoProcessNames, "|")).Output()
+	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if l == "" {
+			continue
+		}
+		lower := strings.ToLower(l)
+		if strings.Contains(lower, "mihomo-tray") {
+			continue
+		}
+		for _, n := range mihomoProcessNames {
+			if strings.Contains(lower, strings.ToLower(n)) {
 				return true
 			}
 		}
@@ -352,30 +488,43 @@ func isRunning() bool {
 	return false
 }
 
+func invalidateRunningCache() {
+	runningCacheAt = time.Time{}
+}
+
 func readTunStatus() bool {
-	data, err := os.ReadFile(resolvePath(activeCfgPath))
+	data, err := readActiveConfig()
 	if err != nil {
 		return false
 	}
-	re := regexp.MustCompile(`tun:\s*\n\s+enable:\s*(true|false)`)
-	m := re.FindStringSubmatch(string(data))
-	return len(m) > 1 && m[1] == "true"
+	m := tunStatusRe.FindSubmatch(data)
+	return len(m) > 2 && string(m[2]) == "true"
 }
 
 func toggleTun() {
 	cur := readTunStatus()
 	newVal := !cur
+	if newVal && !prepareTunEnable() {
+		refreshUI()
+		return
+	}
 	path := resolvePath(activeCfgPath)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
-	re := regexp.MustCompile(`(tun:\s*\n\s+enable:\s*)(true|false)`)
 	valStr := "false"
 	if newVal {
 		valStr = "true"
 	}
-	os.WriteFile(path, re.ReplaceAll(data, []byte("${1}"+valStr)), 0644)
+	if !tunStatusRe.Match(data) {
+		notify("tun.enable not found in config")
+		return
+	}
+	os.WriteFile(path, tunStatusRe.ReplaceAll(data, []byte("${1}"+valStr)), 0644)
+	activeConfigCache = configFileCache{}
+	lastTunOn = newVal
+	saveTrayConfig()
 	if isRunning() {
 		stopMihomo()
 		time.Sleep(500 * time.Millisecond)
@@ -385,46 +534,346 @@ func toggleTun() {
 }
 
 func isProxyEnabled() bool {
-	out, err := exec.Command("networksetup", "-getwebproxy", getNetworkService()).Output()
-	return err == nil && strings.Contains(string(out), "Enabled: Yes")
+	expected := fmt.Sprintf("localhost:%d", readHTTPPort())
+	return isSystemProxyActiveCached(expected)
 }
 
-func toggleSystemProxy() { setSystemProxy(!isProxyEnabled()) }
+func isProxyEnabledFresh() bool {
+	enabled, _ := readSystemProxyState()
+	return enabled
+}
+
+func isMihomoSystemProxyActiveFresh() bool {
+	expected := fmt.Sprintf("localhost:%d", readHTTPPort())
+	webEnabled, webTarget := readSystemProxyState()
+	secureEnabled, secureTarget := readSecureSystemProxyState()
+	return (webEnabled && webTarget == expected) || (secureEnabled && secureTarget == expected)
+}
+
+func toggleSystemProxy() {
+	systemProxyDesired = !systemProxyDesired
+	saveTrayConfig()
+	setSystemProxy(systemProxyDesired)
+}
+
+func toggleProxyGuard() {
+	systemProxyGuardEnabled = !systemProxyGuardEnabled
+	saveTrayConfig()
+	if systemProxyGuardEnabled {
+		ensureSystemProxy()
+	}
+	refreshUI()
+}
+
+func ensureSystemProxy() {
+	if !systemProxyGuardEnabled || !systemProxyDesired {
+		return
+	}
+	expected := fmt.Sprintf("localhost:%d", readHTTPPort())
+	if !systemProxyMatches(expected) {
+		setSystemProxy(true)
+	}
+}
 
 func setSystemProxy(enable bool) {
 	svc := getNetworkService()
 	if enable {
 		port := readHTTPPort()
-		exec.Command("networksetup", "-setwebproxy", svc, fmt.Sprintf("localhost:%d", port)).Run()
-		exec.Command("networksetup", "-setsecurewebproxy", svc, fmt.Sprintf("localhost:%d", port)).Run()
+		exec.Command("networksetup", "-setwebproxy", svc, "localhost", strconv.Itoa(port)).Run()
+		exec.Command("networksetup", "-setsecurewebproxy", svc, "localhost", strconv.Itoa(port)).Run()
 	} else {
 		exec.Command("networksetup", "-setwebproxystate", svc, "off").Run()
 		exec.Command("networksetup", "-setsecurewebproxystate", svc, "off").Run()
 	}
+	invalidateProxyStateCache()
 	refreshUI()
 }
 
 func getNetworkService() string {
+	if networkServiceCacheValue != "" && time.Since(networkServiceCacheAt) < networkServiceCacheTTL {
+		return networkServiceCacheValue
+	}
 	out, _ := exec.Command("networksetup", "-listallnetworkservices").Output()
 	for _, l := range strings.Split(string(out), "\n") {
 		l = strings.TrimSpace(l)
 		if l != "" && !strings.HasPrefix(l, "An asterisk") {
+			networkServiceCacheValue = l
+			networkServiceCacheAt = time.Now()
 			return l
 		}
 	}
+	networkServiceCacheValue = "Wi-Fi"
+	networkServiceCacheAt = time.Now()
 	return "Wi-Fi"
 }
 
 func readHTTPPort() int {
-	data, _ := os.ReadFile(resolvePath(activeCfgPath))
-	re := regexp.MustCompile(`^port:\s*(\d+)`)
-	m := re.FindStringSubmatch(string(data))
-	if len(m) > 1 {
-		var p int
-		fmt.Sscanf(m[1], "%d", &p)
-		return p
+	data, _ := readActiveConfig()
+	return parseHTTPPort(data, 7890)
+}
+
+func readActiveConfig() ([]byte, error) {
+	path := resolvePath(activeCfgPath)
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
 	}
-	return 7890
+	if activeConfigCache.path == path &&
+		activeConfigCache.size == info.Size() &&
+		activeConfigCache.modTime.Equal(info.ModTime()) {
+		return activeConfigCache.data, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	activeConfigCache = configFileCache{
+		path:    path,
+		modTime: info.ModTime(),
+		size:    info.Size(),
+		data:    data,
+	}
+	return data, nil
+}
+
+func parseHTTPPort(data []byte, fallback int) int {
+	m := httpPortRe.FindSubmatch(data)
+	if len(m) < 2 {
+		return fallback
+	}
+	p, err := strconv.Atoi(string(m[1]))
+	if err != nil || p <= 0 || p > 65535 {
+		return fallback
+	}
+	return p
+}
+
+func readSystemProxyState() (bool, string) {
+	return readProxyState("-getwebproxy")
+}
+
+func readSecureSystemProxyState() (bool, string) {
+	return readProxyState("-getsecurewebproxy")
+}
+
+func readProxyState(flag string) (bool, string) {
+	out, err := exec.Command("networksetup", flag, getNetworkService()).Output()
+	if err != nil {
+		return false, ""
+	}
+	return parseNetworksetupProxyState(string(out))
+}
+
+func systemProxyMatches(expected string) bool {
+	webEnabled, webTarget := readSystemProxyState()
+	secureEnabled, secureTarget := readSecureSystemProxyState()
+	return webEnabled && secureEnabled && webTarget == expected && secureTarget == expected
+}
+
+func readSystemProxyStateCached() (bool, string) {
+	if time.Since(proxyStateCacheAt) < proxyStateCacheTTL {
+		return proxyStateCacheEnabled, proxyStateCacheTarget
+	}
+	enabled, target := readSystemProxyState()
+	proxyStateCacheEnabled = enabled
+	proxyStateCacheTarget = target
+	proxyStateCacheAt = time.Now()
+	return enabled, target
+}
+
+func invalidateProxyStateCache() {
+	proxyStateCacheAt = time.Time{}
+}
+
+func isSystemProxyActiveCached(expected string) bool {
+	if time.Since(proxyStateCacheAt) < proxyStateCacheTTL {
+		return proxyStateCacheEnabled && proxyStateCacheTarget == expected
+	}
+	active := systemProxyMatches(expected)
+	proxyStateCacheEnabled = active
+	proxyStateCacheTarget = expected
+	proxyStateCacheAt = time.Now()
+	return active
+}
+
+func parseNetworksetupProxyState(out string) (bool, string) {
+	enabled := false
+	server := ""
+	port := ""
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		switch key {
+		case "Enabled":
+			enabled = strings.EqualFold(value, "Yes")
+		case "Server":
+			server = value
+		case "Port":
+			port = value
+		}
+	}
+	if server == "" || port == "" {
+		return enabled, ""
+	}
+	return enabled, server + ":" + port
+}
+
+func applySavedTunStatus() {
+	if !trayConfigHasTunState {
+		lastTunOn = readTunStatus()
+		saveTrayConfig()
+		return
+	}
+	if lastTunOn == readTunStatus() {
+		return
+	}
+	if lastTunOn && !prepareTunEnable() {
+		return
+	}
+	if writeTunStatus(lastTunOn) {
+		activeConfigCache = configFileCache{}
+	}
+}
+
+func writeTunStatus(enabled bool) bool {
+	path := resolvePath(activeCfgPath)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	if !tunStatusRe.Match(data) {
+		return false
+	}
+	val := "false"
+	if enabled {
+		val = "true"
+	}
+	return os.WriteFile(path, tunStatusRe.ReplaceAll(data, []byte("${1}"+val)), 0644) == nil
+}
+
+func prepareTunEnable() bool {
+	conflicts := findTunConflicts()
+	if len(conflicts) == 0 {
+		return true
+	}
+
+	action := askTunConflictAction(conflicts)
+	switch action {
+	case "stop":
+		stopTunConflicts(conflicts)
+		return true
+	case "continue":
+		return true
+	default:
+		return false
+	}
+}
+
+func findTunConflicts() []tunConflictInfo {
+	out, err := exec.Command("ps", "-axo", "pid=,comm=,args=").Output()
+	if err != nil {
+		return nil
+	}
+	return parseTunConflicts(string(out), tunConflictTargets)
+}
+
+func parseTunConflicts(processList string, targets []tunConflictTarget) []tunConflictInfo {
+	seen := make(map[string]bool)
+	var conflicts []tunConflictInfo
+	for _, line := range strings.Split(processList, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid := fields[0]
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "mihomo-tray") || strings.Contains(lower, "mihomo ") {
+			continue
+		}
+		for _, target := range targets {
+			if !lineMatchesTokens(lower, target.Tokens) {
+				continue
+			}
+			key := target.DisplayName + ":" + pid
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			conflicts = append(conflicts, tunConflictInfo{
+				DisplayName: target.DisplayName,
+				ProcessID:   pid,
+				Command:     compactProcessLine(line),
+				CanStop:     target.CanStop,
+			})
+		}
+	}
+	return conflicts
+}
+
+func lineMatchesTokens(line string, tokens []string) bool {
+	for _, token := range tokens {
+		if strings.Contains(line, strings.ToLower(token)) {
+			return true
+		}
+	}
+	return false
+}
+
+func compactProcessLine(line string) string {
+	if len(line) <= 120 {
+		return line
+	}
+	return line[:117] + "..."
+}
+
+func askTunConflictAction(conflicts []tunConflictInfo) string {
+	var detail strings.Builder
+	for _, c := range conflicts {
+		detail.WriteString("- ")
+		detail.WriteString(c.DisplayName)
+		detail.WriteString(" (PID ")
+		detail.WriteString(c.ProcessID)
+		detail.WriteString(") ")
+		detail.WriteString(strings.ReplaceAll(c.Command, `"`, `'`))
+		detail.WriteString("\n")
+	}
+
+	script := fmt.Sprintf(`
+set conflictText to %s
+set promptText to "TUN mode may conflict with these VPN or game accelerator processes:" & return & return & conflictText & return & "To avoid disrupting them, cancel and close them manually, or continue without stopping them."
+set dlg to display dialog promptText with title "TUN Conflict Check" buttons {"Cancel", "Continue", "Stop Conflicts"} default button "Cancel" cancel button "Cancel"
+return button returned of dlg
+`, appleScriptString(detail.String()))
+	out, err := exec.Command("osascript", "-e", script).Output()
+	if err != nil {
+		return "cancel"
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "Stop Conflicts":
+		return "stop"
+	case "Continue":
+		return "continue"
+	default:
+		return "cancel"
+	}
+}
+
+func stopTunConflicts(conflicts []tunConflictInfo) {
+	for _, c := range conflicts {
+		if !c.CanStop || c.ProcessID == "" {
+			continue
+		}
+		exec.Command("kill", c.ProcessID).Run()
+	}
+	time.Sleep(800 * time.Millisecond)
 }
 
 func plistPath() string {
@@ -497,6 +946,12 @@ return host & "|" & port & "|" & path
 	}
 }
 
+func appleScriptString(s string) string {
+	escaped := strings.ReplaceAll(s, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `"` + escaped + `"`
+}
+
 func updateSubscription(s SubInfo) {
 	resp, err := httpGet(s.URL)
 	if err != nil {
@@ -551,11 +1006,11 @@ func findTopLevelKey(content, key string) int {
 }
 
 func isBase64(s string) bool {
-	s = strings.TrimSpace(s)
+	s = strings.Join(strings.Fields(s), "")
 	if len(s) < 4 || len(s)%4 != 0 {
 		return false
 	}
-	return regexp.MustCompile(`^[A-Za-z0-9+/]+=*$`).MatchString(strings.ReplaceAll(s, " ", ""))
+	return base64CandidateRe.MatchString(s)
 }
 
 func resolveActiveConfig() {
@@ -621,8 +1076,7 @@ func downloadAsset(a updateAsset) error {
 		return fmt.Errorf("API: %v", err)
 	}
 	if strings.Contains(string(jsonBody), `"message"`) {
-		re := regexp.MustCompile(`"message"\s*:\s*"([^"]+)"`)
-		if m := re.FindStringSubmatch(string(jsonBody)); len(m) > 1 {
+		if m := apiMessageRe.FindStringSubmatch(string(jsonBody)); len(m) > 1 {
 			return fmt.Errorf("API: %s", m[1])
 		}
 		return fmt.Errorf("API error")
@@ -689,8 +1143,7 @@ func extractFromZip(data []byte, target string) error {
 }
 
 func findAssetUrl(jsonBody, matchRe, name string) string {
-	re := regexp.MustCompile(`"browser_download_url"\s*:\s*"([^"]+)"`)
-	matches := re.FindAllStringSubmatch(jsonBody, -1)
+	matches := browserDownloadURLRe.FindAllStringSubmatch(jsonBody, -1)
 	if matchRe != "" {
 		mre := regexp.MustCompile(matchRe)
 		for _, m := range matches {
@@ -714,6 +1167,7 @@ func findAssetUrl(jsonBody, matchRe, name string) string {
 }
 
 func loadTrayConfig() {
+	systemProxyGuardEnabled = true
 	if _, err := os.Stat(trayCfgPath); os.IsNotExist(err) {
 		saveDefaultConfig()
 	}
@@ -739,16 +1193,26 @@ func loadTrayConfig() {
 		activeCfgPath = resolvePath(cfg.ActiveConfigPath)
 	}
 	runOnStart = cfg.RunMihomoOnStartup
+	lastTunOn = cfg.LastTunEnabled
+	trayConfigHasTunState = strings.Contains(string(data), "lastTunEnabled")
+	systemProxyDesired = cfg.SystemProxyDesired
+	systemProxyGuardEnabled = cfg.SystemProxyGuardEnabled
+	if !cfg.SystemProxyGuardEnabled && !strings.Contains(string(data), "systemProxyGuardEnabled") {
+		systemProxyGuardEnabled = true
+	}
 	subs = cfg.Subscriptions
 }
 
 func saveTrayConfig() {
 	data, _ := json.MarshalIndent(TrayConfig{
-		Panel:              panelConfig{Host: panelHost, Port: panelPort, Path: panelPath},
-		Profiles:           profiles,
-		ActiveConfigPath:   makeRelative(activeCfgPath),
-		RunMihomoOnStartup: runOnStart,
-		Subscriptions:      subs,
+		Panel:                   panelConfig{Host: panelHost, Port: panelPort, Path: panelPath},
+		Profiles:                profiles,
+		ActiveConfigPath:        makeRelative(activeCfgPath),
+		RunMihomoOnStartup:      runOnStart,
+		LastTunEnabled:          lastTunOn,
+		SystemProxyDesired:      systemProxyDesired,
+		SystemProxyGuardEnabled: systemProxyGuardEnabled,
+		Subscriptions:           subs,
 	}, "", "  ")
 	os.WriteFile(trayCfgPath, data, 0644)
 }
@@ -765,14 +1229,16 @@ func makeRelative(p string) string {
 }
 
 func httpGet(url string) ([]byte, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
 	return io.ReadAll(resp.Body)
 }
 

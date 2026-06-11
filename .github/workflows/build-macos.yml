@@ -19,30 +19,7 @@ jobs:
 
       - name: Build & Package
         working-directory: mihomo-tray-macos
-        run: |
-          go mod tidy
-          CGO_ENABLED=1 go build -ldflags="-s -w" -o mihomo-tray .
-          mkdir -p MihomoTray.app/Contents/MacOS MihomoTray.app/Contents/Resources
-          cp mihomo-tray MihomoTray.app/Contents/MacOS/
-          cp on.png off.png warn.png MihomoTray.app/Contents/Resources/
-          cat > MihomoTray.app/Contents/Info.plist << 'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleName</key>
-              <string>MihomoTray</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.mihomo.tray</string>
-              <key>CFBundleVersion</key>
-              <string>1.0</string>
-              <key>CFBundleExecutable</key>
-              <string>mihomo-tray</string>
-              <key>LSUIElement</key>
-              <true/>
-          </dict>
-          </plist>
-          PLIST
+        run: ./build.sh
 
       - name: Create DMG
         run: hdiutil create -fs HFS+ -srcfolder mihomo-tray-macos/MihomoTray.app -volname MihomoTray MihomoTray.dmg
