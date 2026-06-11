@@ -1,0 +1,26 @@
+name: Build Windows
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-windows.yml"
+      - "mihomo-tray/**"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: mihomo-tray
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MihomoTray-Windows
+          path: mihomo-tray/MihomoTray.exe
