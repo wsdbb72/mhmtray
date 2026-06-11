@@ -97,15 +97,17 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             tag="${{ inputs.tag }}"
           fi
+          assets=(dist/*.zip dist/*.dmg dist/SHA256SUMS.txt)
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
+            gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" dist/* --title "MihomoTray Desktop $tag" --notes-file dist/RELEASE_NOTES.md
+            gh release create "$tag" "${assets[@]}" --target "$GITHUB_SHA" --title "MihomoTray Desktop $tag" --notes-file dist/RELEASE_NOTES.md
           fi
