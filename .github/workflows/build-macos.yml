@@ -3,6 +3,7 @@
 on:
   push:
     paths:
+      - ".github/workflows/build-macos.yml"
       - "mihomo-tray-macos/**"
   workflow_dispatch:
 
@@ -19,7 +20,7 @@ jobs:
 
       - name: Build & Package
         working-directory: mihomo-tray-macos
-        run: ./build.sh
+        run: bash ./build.sh
 
       - name: Create DMG
         run: hdiutil create -fs HFS+ -srcfolder mihomo-tray-macos/MihomoTray.app -volname MihomoTray MihomoTray.dmg
