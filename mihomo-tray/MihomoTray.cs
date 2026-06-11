@@ -276,9 +276,11 @@ namespace MihomoTray
             _menu = new ContextMenuStrip();
             _menu.ShowCheckMargin = true;
             _menu.ShowImageMargin = false;
+            UiStyles.ApplyMenu(_menu);
 
             _statusItem = new ToolStripMenuItem("Mihomo - 已停止");
             _statusItem.Enabled = false;
+            _statusItem.Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold);
             _menu.Items.Add(_statusItem);
 
             _menu.Items.Add(new ToolStripSeparator());
@@ -340,6 +342,7 @@ namespace MihomoTray
             _menu.Items.Add(exitItem);
 
             _menu.Opening += OnMenuOpening;
+            UiStyles.ApplyMenuItems(_menu);
 
             _trayIcon.ContextMenuStrip = _menu;
         }
@@ -377,6 +380,8 @@ namespace MihomoTray
                 var updateAll = new ToolStripMenuItem("更新全部", null, OnUpdateAllSubscriptions);
                 _subMenu.DropDownItems.Add(updateAll);
             }
+
+            UiStyles.ApplyMenuItems(_subMenu.DropDown);
         }
 
         void RefreshUI()
@@ -411,20 +416,20 @@ namespace MihomoTray
             }
 
             _tunItem.Checked = tunOn;
-            _tunItem.Text = tunOn ? "TUN 模式: 已开启" : "TUN 模式: 已关闭";
+            _tunItem.Text = tunOn ? "TUN 模式" : "TUN 模式";
 
             _proxyItem.Checked = _systemProxyDesired;
             if (_systemProxyDesired && !proxyOn)
                 _proxyItem.Text = _systemProxyGuardEnabled
-                    ? "系统代理: 修复中 (localhost:" + httpPort + ")"
-                    : "系统代理: 未指向本程序 (localhost:" + httpPort + ")";
+                    ? "系统代理 (修复中)"
+                    : "系统代理 (未指向本程序)";
             else
-                _proxyItem.Text = proxyOn ? "系统代理: 已开启 (localhost:" + httpPort + ")" : "系统代理: 已关闭";
+                _proxyItem.Text = proxyOn ? "系统代理 (localhost:" + httpPort + ")" : "系统代理";
 
             if (_proxyGuardItem != null)
             {
                 _proxyGuardItem.Checked = _systemProxyGuardEnabled;
-                _proxyGuardItem.Text = _systemProxyGuardEnabled ? "系统代理守护: 已开启" : "系统代理守护: 已关闭";
+                _proxyGuardItem.Text = "系统代理守护";
             }
 
             if (_runMihomoItem != null)
@@ -529,6 +534,7 @@ namespace MihomoTray
             using (var stopButton = new Button())
             {
                 dlg.Text = "TUN 模式冲突检测";
+                UiStyles.ApplyForm(dlg);
                 dlg.StartPosition = FormStartPosition.CenterParent;
                 dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
                 dlg.MaximizeBox = false;
@@ -537,12 +543,14 @@ namespace MihomoTray
                 dlg.ClientSize = new Size(560, 320);
 
                 intro.Text = "检测到可能与 TUN 模式冲突的程序或虚拟网卡。建议先停用冲突项，以免路由异常。";
+                intro.ForeColor = UiStyles.MutedText;
                 intro.SetBounds(16, 16, 528, 36);
 
                 detail.Multiline = true;
                 detail.ReadOnly = true;
                 detail.ScrollBars = ScrollBars.Vertical;
                 detail.Text = sb.ToString();
+                UiStyles.ApplyTextBox(detail);
                 detail.SetBounds(16, 58, 528, 176);
 
                 cancelButton.Text = "不开启";
@@ -579,6 +587,7 @@ namespace MihomoTray
                 dlg.Controls.Add(continueButton);
                 dlg.Controls.Add(stopButton);
                 dlg.CancelButton = cancelButton;
+                UiStyles.StyleDialogButtons(continueButton, cancelButton, stopButton);
 
                 dlg.ShowDialog(this);
             }
@@ -2660,6 +2669,252 @@ namespace MihomoTray
         public bool IsZip { get; set; }
     }
 
+    static class UiStyles
+    {
+        public static readonly Color WindowBack = Color.FromArgb(248, 249, 250);
+        public static readonly Color PanelBack = Color.White;
+        public static readonly Color Border = Color.FromArgb(218, 220, 224);
+        public static readonly Color Text = Color.FromArgb(32, 33, 36);
+        public static readonly Color MutedText = Color.FromArgb(95, 99, 104);
+        public static readonly Color Accent = Color.FromArgb(26, 115, 232);
+        public static readonly Color AccentHover = Color.FromArgb(24, 90, 188);
+        public static readonly Color HoverBack = Color.FromArgb(232, 240, 254);
+        public static readonly Font BaseFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
+        public static readonly Font TitleFont = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold, GraphicsUnit.Point);
+
+        public static void ApplyMenu(ContextMenuStrip menu)
+        {
+            menu.Font = BaseFont;
+            menu.BackColor = PanelBack;
+            menu.ForeColor = Text;
+            menu.Renderer = new CleanMenuRenderer();
+            menu.Padding = new Padding(4, 6, 4, 6);
+        }
+
+        public static void ApplyMenuItems(ToolStrip menu)
+        {
+            if (menu == null)
+                return;
+
+            menu.Font = BaseFont;
+            menu.BackColor = PanelBack;
+            menu.ForeColor = Text;
+            menu.Renderer = new CleanMenuRenderer();
+            menu.Padding = new Padding(4, 6, 4, 6);
+
+            foreach (ToolStripItem item in menu.Items)
+            {
+                item.Font = BaseFont;
+                item.ForeColor = item.Enabled ? Text : MutedText;
+
+                if (item is ToolStripSeparator)
+                {
+                    item.Margin = new Padding(8, 5, 8, 5);
+                    continue;
+                }
+
+                item.Margin = new Padding(2, 1, 2, 1);
+                item.Padding = new Padding(12, 5, 12, 5);
+
+                ToolStripMenuItem menuItem = item as ToolStripMenuItem;
+                if (menuItem != null && menuItem.HasDropDownItems)
+                {
+                    menuItem.DropDown.BackColor = PanelBack;
+                    menuItem.DropDown.ForeColor = Text;
+                    menuItem.DropDown.Renderer = new CleanMenuRenderer();
+                    menuItem.DropDown.Padding = new Padding(4, 6, 4, 6);
+                    ApplyMenuItems(menuItem.DropDown);
+                }
+
+                if (!item.Enabled)
+                {
+                    item.Padding = new Padding(12, 6, 12, 6);
+                    item.Font = TitleFont;
+                }
+            }
+        }
+
+        public static void ApplyForm(Form form)
+        {
+            form.Font = BaseFont;
+            form.BackColor = WindowBack;
+            form.ForeColor = Text;
+            form.StartPosition = FormStartPosition.CenterParent;
+        }
+
+        public static void ApplyControls(Control parent)
+        {
+            foreach (Control control in parent.Controls)
+            {
+                control.Font = BaseFont;
+                control.ForeColor = Text;
+
+                if (control is Button)
+                {
+                    Button button = (Button)control;
+                    ApplyButton(button, button.DialogResult == DialogResult.OK || button.Text.IndexOf("开始", StringComparison.OrdinalIgnoreCase) >= 0);
+                }
+                else if (control is TextBox)
+                {
+                    ApplyTextBox((TextBox)control);
+                }
+                else if (control is DataGridView)
+                {
+                    ApplyGrid((DataGridView)control);
+                }
+                else if (control is CheckedListBox)
+                {
+                    ApplyCheckedList((CheckedListBox)control);
+                }
+                else if (control is Label)
+                {
+                    control.BackColor = Color.Transparent;
+                }
+
+                if (control.HasChildren)
+                    ApplyControls(control);
+            }
+        }
+
+        public static void ApplyButton(Button button, bool primary)
+        {
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderSize = 1;
+            button.FlatAppearance.BorderColor = primary ? Accent : Border;
+            button.BackColor = primary ? Accent : PanelBack;
+            button.ForeColor = primary ? Color.White : Text;
+            button.Height = Math.Max(button.Height, 30);
+            button.Cursor = Cursors.Hand;
+        }
+
+        public static void ApplyTextBox(TextBox box)
+        {
+            box.BorderStyle = BorderStyle.FixedSingle;
+            box.BackColor = Color.White;
+            box.ForeColor = Text;
+        }
+
+        public static void ApplyGrid(DataGridView grid)
+        {
+            grid.BorderStyle = BorderStyle.None;
+            grid.BackgroundColor = PanelBack;
+            grid.GridColor = Border;
+            grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+            grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single;
+            grid.EnableHeadersVisualStyles = false;
+            grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
+            grid.ColumnHeadersDefaultCellStyle.ForeColor = Text;
+            grid.ColumnHeadersDefaultCellStyle.Font = TitleFont;
+            grid.ColumnHeadersHeight = 32;
+            grid.DefaultCellStyle.BackColor = PanelBack;
+            grid.DefaultCellStyle.ForeColor = Text;
+            grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
+            grid.DefaultCellStyle.SelectionForeColor = Text;
+            grid.RowTemplate.Height = 28;
+            grid.RowHeadersVisible = false;
+            grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            grid.MultiSelect = false;
+        }
+
+        public static void ApplyCheckedList(CheckedListBox list)
+        {
+            list.BorderStyle = BorderStyle.FixedSingle;
+            list.BackColor = PanelBack;
+            list.ForeColor = Text;
+        }
+
+        public static void StyleDialogButtons(params Button[] buttons)
+        {
+            for (int i = 0; i < buttons.Length; i++)
+            {
+                ApplyButton(buttons[i], i == 0);
+            }
+        }
+    }
+
+    class CleanMenuRenderer : ToolStripProfessionalRenderer
+    {
+        public CleanMenuRenderer() : base(new CleanMenuColorTable()) { }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            Rectangle rect = new Rectangle(4, 1, e.Item.Width - 8, e.Item.Height - 2);
+            Color fill = e.Item.Selected && e.Item.Enabled ? UiStyles.HoverBack : UiStyles.PanelBack;
+            using (var brush = new SolidBrush(fill))
+            using (var path = RoundedRect(rect, 4))
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                e.Graphics.FillPath(brush, path);
+            }
+        }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            e.TextColor = e.Item.Enabled ? UiStyles.Text : UiStyles.MutedText;
+            base.OnRenderItemText(e);
+        }
+
+        protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e)
+        {
+            e.ArrowColor = e.Item.Enabled ? UiStyles.MutedText : UiStyles.Border;
+            base.OnRenderArrow(e);
+        }
+
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
+        {
+            Rectangle rect = e.ImageRectangle;
+            int midY = rect.Top + rect.Height / 2;
+            Point[] points = new Point[]
+            {
+                new Point(rect.Left + 3, midY),
+                new Point(rect.Left + 7, midY + 4),
+                new Point(rect.Right - 3, rect.Top + 4)
+            };
+
+            using (var pen = new Pen(UiStyles.Accent, 2F))
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                e.Graphics.DrawLines(pen, points);
+            }
+        }
+
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            int y = e.Item.Height / 2;
+            using (var pen = new Pen(UiStyles.Border))
+                e.Graphics.DrawLine(pen, 12, y, e.Item.Width - 12, y);
+        }
+
+        static GraphicsPath RoundedRect(Rectangle bounds, int radius)
+        {
+            int diameter = radius * 2;
+            var path = new GraphicsPath();
+            if (diameter <= 0)
+            {
+                path.AddRectangle(bounds);
+                return path;
+            }
+
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    class CleanMenuColorTable : ProfessionalColorTable
+    {
+        public override Color ToolStripDropDownBackground { get { return UiStyles.PanelBack; } }
+        public override Color ImageMarginGradientBegin { get { return UiStyles.PanelBack; } }
+        public override Color ImageMarginGradientMiddle { get { return UiStyles.PanelBack; } }
+        public override Color ImageMarginGradientEnd { get { return UiStyles.PanelBack; } }
+        public override Color MenuItemSelected { get { return Color.FromArgb(229, 240, 255); } }
+        public override Color MenuBorder { get { return UiStyles.Border; } }
+        public override Color MenuItemBorder { get { return Color.FromArgb(191, 219, 254); } }
+    }
+
     class PanelSettingsForm : Form
     {
         TextBox _hostBox;
@@ -2673,6 +2928,7 @@ namespace MihomoTray
         public PanelSettingsForm(string host, int port, string path)
         {
             Text = "面板设置";
+            UiStyles.ApplyForm(this);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
@@ -2704,6 +2960,7 @@ namespace MihomoTray
 
             AcceptButton = okButton;
             CancelButton = cancelButton;
+            UiStyles.ApplyControls(this);
         }
     }
 
@@ -2716,6 +2973,7 @@ namespace MihomoTray
         public SubscriptionManagerForm(List<SubscriptionInfo> items)
         {
             Text = "订阅管理";
+            UiStyles.ApplyForm(this);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
@@ -2818,6 +3076,7 @@ namespace MihomoTray
 
             AcceptButton = okBtn;
             CancelButton = cancelBtn;
+            UiStyles.ApplyControls(this);
         }
 
         void MoveSelected(int delta)
@@ -2850,6 +3109,7 @@ namespace MihomoTray
         public SubscriptionEditForm(SubscriptionInfo item, bool isNew)
         {
             Text = isNew ? "新增订阅" : "编辑订阅";
+            UiStyles.ApplyForm(this);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
@@ -2887,6 +3147,7 @@ namespace MihomoTray
 
             AcceptButton = okBtn;
             CancelButton = cancelBtn;
+            UiStyles.ApplyControls(this);
         }
     }
 
@@ -2902,6 +3163,7 @@ namespace MihomoTray
         public ConfigProfileManagerForm(List<ConfigProfile> items, string activeConfigPath, string basePath)
         {
             Text = "配置切换";
+            UiStyles.ApplyForm(this);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
@@ -3061,6 +3323,7 @@ namespace MihomoTray
             AcceptButton = okBtn;
             CancelButton = cancelBtn;
             SelectActiveProfile();
+            UiStyles.ApplyControls(this);
         }
 
         int CurrentIndex()
@@ -3297,6 +3560,7 @@ namespace MihomoTray
         public ConfigProfileEditForm(ConfigProfile item, string basePath, bool isNew)
         {
             Text = isNew ? "新增配置" : "编辑配置";
+            UiStyles.ApplyForm(this);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
@@ -3351,6 +3615,7 @@ namespace MihomoTray
 
             AcceptButton = okBtn;
             CancelButton = cancelBtn;
+            UiStyles.ApplyControls(this);
         }
 
         string MakeRelativeOrAbsolute(string file)
@@ -3376,6 +3641,7 @@ namespace MihomoTray
         public AssetUpdateForm()
         {
             Text = "一键更新组件";
+            UiStyles.ApplyForm(this);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
@@ -3472,6 +3738,7 @@ namespace MihomoTray
 
             AcceptButton = okBtn;
             CancelButton = cancelBtn;
+            UiStyles.ApplyControls(this);
         }
 
         public List<AssetUpdateOption> GetOptions()
