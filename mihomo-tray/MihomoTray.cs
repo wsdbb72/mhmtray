@@ -3158,11 +3158,12 @@ namespace MihomoTray
 
         protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
         {
-            if (e.Image != null)
+            Image image = e.Item.Image;
+            if (image != null)
             {
                 Rectangle rect = IconRectangle(e.Item);
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                e.Graphics.DrawImage(e.Image, rect);
+                e.Graphics.DrawImage(image, rect);
                 return;
             }
 
