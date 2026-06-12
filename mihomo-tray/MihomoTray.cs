@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
@@ -274,71 +275,95 @@ namespace MihomoTray
         void BuildMenu()
         {
             _menu = new ContextMenuStrip();
-            _menu.ShowCheckMargin = true;
-            _menu.ShowImageMargin = false;
+            _menu.ShowCheckMargin = false;
+            _menu.ShowImageMargin = true;
             UiStyles.ApplyMenu(_menu);
 
             _statusItem = new ToolStripMenuItem("Mihomo - 已停止");
             _statusItem.Enabled = false;
-            _statusItem.Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold);
+            _statusItem.Image = UiStyles.MenuIcon("status-off", false);
+            _statusItem.Tag = "caption";
             _menu.Items.Add(_statusItem);
 
             _menu.Items.Add(new ToolStripSeparator());
 
+            var openPanelItem = new ToolStripMenuItem("打开面板", null, OnOpenPanel);
+            openPanelItem.Image = UiStyles.MenuIcon("panel", false);
+            _menu.Items.Add(openPanelItem);
+
             _startStopItem = new ToolStripMenuItem("启动 Mihomo", null, OnStartStop);
+            _startStopItem.Image = UiStyles.MenuIcon("play", false);
             _menu.Items.Add(_startStopItem);
 
             _menu.Items.Add(new ToolStripSeparator());
 
             _tunItem = new ToolStripMenuItem("TUN 模式", null, OnToggleTun);
+            _tunItem.Image = UiStyles.MenuIcon("tun", false);
             _menu.Items.Add(_tunItem);
 
             _proxyItem = new ToolStripMenuItem("系统代理", null, OnToggleSystemProxy);
+            _proxyItem.Image = UiStyles.MenuIcon("proxy", false);
             _proxyItem.Checked = _systemProxyDesired;
             _menu.Items.Add(_proxyItem);
 
             _proxyGuardItem = new ToolStripMenuItem("系统代理守护", null, OnToggleProxyGuard);
+            _proxyGuardItem.Image = UiStyles.MenuIcon("guard", false);
             _proxyGuardItem.Checked = _systemProxyGuardEnabled;
             _menu.Items.Add(_proxyGuardItem);
 
             _menu.Items.Add(new ToolStripSeparator());
 
-            var openPanelItem = new ToolStripMenuItem("打开面板", null, OnOpenPanel);
-            _menu.Items.Add(openPanelItem);
-
-            _panelSettingsItem = new ToolStripMenuItem("面板设置", null, OnPanelSettings);
-            _menu.Items.Add(_panelSettingsItem);
-
+            var configMenu = new ToolStripMenuItem("配置与订阅");
+            configMenu.Image = UiStyles.MenuIcon("profile", false);
             _profileItem = new ToolStripMenuItem("配置切换", null, OnProfileManager);
-            _menu.Items.Add(_profileItem);
-
-            _menu.Items.Add(new ToolStripSeparator());
+            _profileItem.Image = UiStyles.MenuIcon("profile", false);
+            configMenu.DropDownItems.Add(_profileItem);
 
             _subMenu = new ToolStripMenuItem("更新订阅");
-            _menu.Items.Add(_subMenu);
+            _subMenu.Image = UiStyles.MenuIcon("refresh", false);
+            configMenu.DropDownItems.Add(_subMenu);
 
             _subMgrItem = new ToolStripMenuItem("订阅管理", null, OnSubscriptionManager);
-            _menu.Items.Add(_subMgrItem);
+            _subMgrItem.Image = UiStyles.MenuIcon("list", false);
+            configMenu.DropDownItems.Add(_subMgrItem);
 
-            var editSubItem = new ToolStripMenuItem("编辑订阅设置", null, OnEditSubConfig);
-            _menu.Items.Add(editSubItem);
+            var editSubItem = new ToolStripMenuItem("编辑订阅源", null, OnEditSubConfig);
+            editSubItem.Image = UiStyles.MenuIcon("edit", false);
+            configMenu.DropDownItems.Add(editSubItem);
+            _menu.Items.Add(configMenu);
 
-            _updateAssetsItem = new ToolStripMenuItem("一键更新组件", null, OnUpdateAssets);
-            _menu.Items.Add(_updateAssetsItem);
+            var toolsMenu = new ToolStripMenuItem("工具");
+            toolsMenu.Image = UiStyles.MenuIcon("settings", false);
+            _panelSettingsItem = new ToolStripMenuItem("面板设置", null, OnPanelSettings);
+            _panelSettingsItem.Image = UiStyles.MenuIcon("settings", false);
+            toolsMenu.DropDownItems.Add(_panelSettingsItem);
+
+            _updateAssetsItem = new ToolStripMenuItem("更新组件", null, OnUpdateAssets);
+            _updateAssetsItem.Image = UiStyles.MenuIcon("download", false);
+            toolsMenu.DropDownItems.Add(_updateAssetsItem);
+            _menu.Items.Add(toolsMenu);
 
             _menu.Items.Add(new ToolStripSeparator());
 
-            _runMihomoItem = new ToolStripMenuItem("启动时运行 Mihomo", null, OnToggleRunMihomoOnStartup);
+            var startupMenu = new ToolStripMenuItem("启动设置");
+            startupMenu.Image = UiStyles.MenuIcon("startup", false);
+            _runMihomoItem = new ToolStripMenuItem("启动程序时运行核心", null, OnToggleRunMihomoOnStartup);
+            _runMihomoItem.Image = UiStyles.MenuIcon("startup", false);
             _runMihomoItem.Checked = _runMihomoOnStartup;
-            _menu.Items.Add(_runMihomoItem);
+            startupMenu.DropDownItems.Add(_runMihomoItem);
 
-            _autoStartItem = new ToolStripMenuItem("开机自启", null, OnToggleAutoStart);
+            _autoStartItem = new ToolStripMenuItem("跟随系统启动", null, OnToggleAutoStart);
+            _autoStartItem.Image = UiStyles.MenuIcon("power", false);
             _autoStartItem.Checked = IsAutoStartEnabled();
-            _menu.Items.Add(_autoStartItem);
+            startupMenu.DropDownItems.Add(_autoStartItem);
+            _menu.Items.Add(startupMenu);
 
             _menu.Items.Add(new ToolStripSeparator());
 
             var exitItem = new ToolStripMenuItem("退出", null, OnExit);
+            exitItem.Image = UiStyles.MenuIcon("exit", false);
+            exitItem.ForeColor = UiStyles.Danger;
+            exitItem.Tag = "danger";
             _menu.Items.Add(exitItem);
 
             _menu.Opening += OnMenuOpening;
@@ -365,6 +390,7 @@ namespace MihomoTray
             {
                 var empty = new ToolStripMenuItem("(无订阅配置)");
                 empty.Enabled = false;
+                empty.Image = UiStyles.MenuIcon("empty", false);
                 _subMenu.DropDownItems.Add(empty);
             }
             else
@@ -374,10 +400,12 @@ namespace MihomoTray
                     var subRef = sub;
                     var item = new ToolStripMenuItem(sub.Name, null,
                         delegate { OnUpdateSubscription(subRef); });
+                    item.Image = UiStyles.MenuIcon("refresh", false);
                     _subMenu.DropDownItems.Add(item);
                 }
                 _subMenu.DropDownItems.Add(new ToolStripSeparator());
                 var updateAll = new ToolStripMenuItem("更新全部", null, OnUpdateAllSubscriptions);
+                updateAll.Image = UiStyles.MenuIcon("download", false);
                 _subMenu.DropDownItems.Add(updateAll);
             }
 
@@ -395,12 +423,16 @@ namespace MihomoTray
             if (running)
             {
                 _startStopItem.Text = "停止 Mihomo";
+                _startStopItem.Image = UiStyles.MenuIcon("stop", false);
                 _trayIcon.Text = "Mihomo - 运行中"
                     + (tunOn ? " (TUN:开启)" : "")
                     + (proxyOn ? " (代理:开启)" : "")
                     + adminTag;
                 if (_statusItem != null)
+                {
                     _statusItem.Text = "Mihomo - 运行中" + adminTag;
+                    _statusItem.Image = UiStyles.MenuIcon("status-on", false);
+                }
                 if (!tunOn && !proxyOn)
                     _trayIcon.Icon = _iconWarn;
                 else
@@ -409,34 +441,47 @@ namespace MihomoTray
             else
             {
                 _startStopItem.Text = "启动 Mihomo";
+                _startStopItem.Image = UiStyles.MenuIcon("play", false);
                 _trayIcon.Icon = _iconStopped;
                 _trayIcon.Text = "Mihomo - 已停止" + adminTag;
                 if (_statusItem != null)
+                {
                     _statusItem.Text = "Mihomo - 已停止" + adminTag;
+                    _statusItem.Image = UiStyles.MenuIcon("status-off", false);
+                }
             }
 
             _tunItem.Checked = tunOn;
-            _tunItem.Text = tunOn ? "TUN 模式" : "TUN 模式";
+            _tunItem.Text = tunOn ? "TUN 模式已开启" : "TUN 模式";
+            _tunItem.Image = UiStyles.MenuIcon("tun", tunOn);
 
             _proxyItem.Checked = _systemProxyDesired;
             if (_systemProxyDesired && !proxyOn)
                 _proxyItem.Text = _systemProxyGuardEnabled
-                    ? "系统代理 (修复中)"
-                    : "系统代理 (未指向本程序)";
+                    ? "系统代理修复中"
+                    : "系统代理未指向本程序";
             else
-                _proxyItem.Text = proxyOn ? "系统代理 (localhost:" + httpPort + ")" : "系统代理";
+                _proxyItem.Text = proxyOn ? "系统代理已开启" : "系统代理";
+            _proxyItem.Image = UiStyles.MenuIcon("proxy", _systemProxyDesired && proxyOn);
 
             if (_proxyGuardItem != null)
             {
                 _proxyGuardItem.Checked = _systemProxyGuardEnabled;
                 _proxyGuardItem.Text = "系统代理守护";
+                _proxyGuardItem.Image = UiStyles.MenuIcon("guard", _systemProxyGuardEnabled);
             }
 
             if (_runMihomoItem != null)
+            {
                 _runMihomoItem.Checked = _runMihomoOnStartup;
+                _runMihomoItem.Image = UiStyles.MenuIcon("startup", _runMihomoOnStartup);
+            }
 
             if (_autoStartItem != null)
+            {
                 _autoStartItem.Checked = IsAutoStartEnabled();
+                _autoStartItem.Image = UiStyles.MenuIcon("power", _autoStartItem.Checked);
+            }
         }
 
         void InitializeSavedProxyModes()
@@ -2671,24 +2716,30 @@ namespace MihomoTray
 
     static class UiStyles
     {
-        public static readonly Color WindowBack = Color.FromArgb(248, 249, 250);
+        const string MenuSurfaceTag = "telegram-menu-surface";
+
+        static readonly Dictionary<string, Image> IconCache = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
+
+        public static readonly Color WindowBack = Color.FromArgb(244, 247, 250);
         public static readonly Color PanelBack = Color.White;
-        public static readonly Color Border = Color.FromArgb(218, 220, 224);
-        public static readonly Color Text = Color.FromArgb(32, 33, 36);
-        public static readonly Color MutedText = Color.FromArgb(95, 99, 104);
-        public static readonly Color Accent = Color.FromArgb(26, 115, 232);
-        public static readonly Color AccentHover = Color.FromArgb(24, 90, 188);
-        public static readonly Color HoverBack = Color.FromArgb(232, 240, 254);
-        public static readonly Font BaseFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
-        public static readonly Font TitleFont = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold, GraphicsUnit.Point);
+        public static readonly Color Border = Color.FromArgb(217, 225, 232);
+        public static readonly Color Text = Color.FromArgb(35, 40, 45);
+        public static readonly Color MutedText = Color.FromArgb(112, 126, 140);
+        public static readonly Color IconText = Color.FromArgb(128, 143, 156);
+        public static readonly Color Accent = Color.FromArgb(42, 171, 238);
+        public static readonly Color AccentHover = Color.FromArgb(38, 152, 214);
+        public static readonly Color HoverBack = Color.FromArgb(244, 248, 251);
+        public static readonly Color Danger = Color.FromArgb(229, 57, 53);
+        public static readonly Color ActiveGreen = Color.FromArgb(52, 199, 89);
+        public static readonly Font BaseFont = CreateFont(9.25F, FontStyle.Regular);
+        public static readonly Font TitleFont = CreateFont(9.25F, FontStyle.Bold);
+        public static readonly Font CaptionFont = CreateFont(8.75F, FontStyle.Regular);
 
         public static void ApplyMenu(ContextMenuStrip menu)
         {
-            menu.Font = BaseFont;
-            menu.BackColor = PanelBack;
-            menu.ForeColor = Text;
-            menu.Renderer = new CleanMenuRenderer();
-            menu.Padding = new Padding(4, 6, 4, 6);
+            menu.ShowCheckMargin = false;
+            menu.ShowImageMargin = true;
+            PrepareMenuSurface(menu);
         }
 
         public static void ApplyMenuItems(ToolStrip menu)
@@ -2696,41 +2747,80 @@ namespace MihomoTray
             if (menu == null)
                 return;
 
-            menu.Font = BaseFont;
-            menu.BackColor = PanelBack;
-            menu.ForeColor = Text;
-            menu.Renderer = new CleanMenuRenderer();
-            menu.Padding = new Padding(4, 6, 4, 6);
+            PrepareMenuSurface(menu);
 
             foreach (ToolStripItem item in menu.Items)
             {
                 item.Font = BaseFont;
-                item.ForeColor = item.Enabled ? Text : MutedText;
+                item.ForeColor = MenuTextColor(item);
+                item.ImageScaling = ToolStripItemImageScaling.None;
+                item.TextImageRelation = TextImageRelation.ImageBeforeText;
 
                 if (item is ToolStripSeparator)
                 {
-                    item.Margin = new Padding(8, 5, 8, 5);
+                    item.Margin = new Padding(14, 5, 14, 5);
                     continue;
                 }
 
-                item.Margin = new Padding(2, 1, 2, 1);
-                item.Padding = new Padding(12, 5, 12, 5);
+                item.AutoSize = true;
+                item.Margin = new Padding(5, 1, 5, 1);
+                item.Padding = new Padding(6, 5, 18, 5);
 
                 ToolStripMenuItem menuItem = item as ToolStripMenuItem;
                 if (menuItem != null && menuItem.HasDropDownItems)
                 {
-                    menuItem.DropDown.BackColor = PanelBack;
-                    menuItem.DropDown.ForeColor = Text;
-                    menuItem.DropDown.Renderer = new CleanMenuRenderer();
-                    menuItem.DropDown.Padding = new Padding(4, 6, 4, 6);
+                    menuItem.Padding = new Padding(6, 5, 26, 5);
+                    PrepareMenuSurface(menuItem.DropDown);
                     ApplyMenuItems(menuItem.DropDown);
                 }
 
-                if (!item.Enabled)
+                if (IsCaption(item))
                 {
-                    item.Padding = new Padding(12, 6, 12, 6);
-                    item.Font = TitleFont;
+                    item.Padding = new Padding(6, 6, 18, 6);
+                    item.Font = CaptionFont;
+                    item.ForeColor = MutedText;
                 }
+            }
+        }
+
+        static void PrepareMenuSurface(ToolStrip menu)
+        {
+            menu.Font = BaseFont;
+            menu.BackColor = PanelBack;
+            menu.ForeColor = Text;
+            menu.Renderer = new TelegramMenuRenderer();
+            menu.Padding = new Padding(4, 7, 4, 7);
+            menu.ImageScalingSize = new Size(18, 18);
+
+            ToolStripDropDown dropDown = menu as ToolStripDropDown;
+            if (dropDown != null)
+                dropDown.DropShadowEnabled = true;
+
+            ContextMenuStrip context = menu as ContextMenuStrip;
+            if (context != null)
+                context.ShowItemToolTips = false;
+
+            if (!string.Equals(menu.Tag as string, MenuSurfaceTag, StringComparison.Ordinal))
+            {
+                menu.Tag = MenuSurfaceTag;
+                menu.SizeChanged += delegate { UpdateRoundedRegion(menu); };
+                menu.VisibleChanged += delegate { UpdateRoundedRegion(menu); };
+            }
+
+            UpdateRoundedRegion(menu);
+        }
+
+        static void UpdateRoundedRegion(ToolStrip menu)
+        {
+            if (menu.Width <= 0 || menu.Height <= 0)
+                return;
+
+            using (var path = RoundedRect(new Rectangle(0, 0, menu.Width, menu.Height), 10))
+            {
+                Region old = menu.Region;
+                menu.Region = new Region(path);
+                if (old != null)
+                    old.Dispose();
             }
         }
 
@@ -2830,47 +2920,300 @@ namespace MihomoTray
                 ApplyButton(buttons[i], i == 0);
             }
         }
+
+        public static bool IsDanger(ToolStripItem item)
+        {
+            return string.Equals(item.Tag as string, "danger", StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static bool IsCaption(ToolStripItem item)
+        {
+            return string.Equals(item.Tag as string, "caption", StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static Color MenuTextColor(ToolStripItem item)
+        {
+            if (IsDanger(item))
+                return Danger;
+            if (!item.Enabled || IsCaption(item))
+                return MutedText;
+            return Text;
+        }
+
+        public static Image MenuIcon(string key, bool active)
+        {
+            string cacheKey = key + ":" + active.ToString();
+            Image image;
+            if (IconCache.TryGetValue(cacheKey, out image))
+                return image;
+
+            image = CreateMenuIcon(key, active);
+            IconCache[cacheKey] = image;
+            return image;
+        }
+
+        public static GraphicsPath RoundedRect(Rectangle bounds, int radius)
+        {
+            int diameter = radius * 2;
+            var path = new GraphicsPath();
+            if (diameter <= 0)
+            {
+                path.AddRectangle(bounds);
+                return path;
+            }
+
+            Rectangle arc = new Rectangle(bounds.Left, bounds.Top, diameter, diameter);
+            path.AddArc(arc, 180, 90);
+            arc.X = bounds.Right - diameter;
+            path.AddArc(arc, 270, 90);
+            arc.Y = bounds.Bottom - diameter;
+            path.AddArc(arc, 0, 90);
+            arc.X = bounds.Left;
+            path.AddArc(arc, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        static Font CreateFont(float size, FontStyle style)
+        {
+            string[] names = new string[] { "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", SystemFonts.MessageBoxFont.FontFamily.Name };
+            string familyName = names[names.Length - 1];
+
+            try
+            {
+                using (var installed = new InstalledFontCollection())
+                {
+                    for (int i = 0; i < names.Length; i++)
+                    {
+                        for (int j = 0; j < installed.Families.Length; j++)
+                        {
+                            if (string.Equals(installed.Families[j].Name, names[i], StringComparison.OrdinalIgnoreCase))
+                            {
+                                familyName = names[i];
+                                i = names.Length;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return new Font(familyName, size, style, GraphicsUnit.Point);
+        }
+
+        static Image CreateMenuIcon(string key, bool active)
+        {
+            var bmp = new Bitmap(18, 18);
+            Color color = active ? Accent : IconText;
+            if (string.Equals(key, "exit", StringComparison.OrdinalIgnoreCase))
+                color = Danger;
+            if (string.Equals(key, "status-on", StringComparison.OrdinalIgnoreCase))
+                color = ActiveGreen;
+            if (string.Equals(key, "status-off", StringComparison.OrdinalIgnoreCase))
+                color = MutedText;
+
+            using (Graphics g = Graphics.FromImage(bmp))
+            using (Pen pen = new Pen(color, 1.65F))
+            using (SolidBrush brush = new SolidBrush(color))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                pen.LineJoin = LineJoin.Round;
+
+                if (key == "status-on" || key == "status-off" || key == "empty")
+                {
+                    g.FillEllipse(brush, 6, 6, 6, 6);
+                }
+                else if (key == "play")
+                {
+                    Point[] pts = new Point[] { new Point(7, 4), new Point(14, 9), new Point(7, 14) };
+                    g.FillPolygon(brush, pts);
+                }
+                else if (key == "stop")
+                {
+                    g.FillRectangle(brush, 5, 5, 8, 8);
+                }
+                else if (key == "proxy")
+                {
+                    g.DrawEllipse(pen, 3, 3, 12, 12);
+                    g.DrawLine(pen, 3, 9, 15, 9);
+                    g.DrawArc(pen, 5, 3, 8, 12, 90, 180);
+                    g.DrawArc(pen, 5, 3, 8, 12, 270, 180);
+                }
+                else if (key == "tun")
+                {
+                    Point[] pts = new Point[] { new Point(9, 3), new Point(14, 5), new Point(13, 11), new Point(9, 15), new Point(5, 11), new Point(4, 5) };
+                    g.DrawPolygon(pen, pts);
+                    g.DrawLine(pen, 7, 9, 9, 11);
+                    g.DrawLine(pen, 9, 11, 12, 7);
+                }
+                else if (key == "guard")
+                {
+                    Point[] pts = new Point[] { new Point(9, 3), new Point(14, 5), new Point(13, 11), new Point(9, 15), new Point(5, 11), new Point(4, 5) };
+                    g.DrawPolygon(pen, pts);
+                    g.DrawLine(pen, 7, 9, 9, 11);
+                    g.DrawLine(pen, 9, 11, 12, 7);
+                }
+                else if (key == "panel")
+                {
+                    g.DrawRectangle(pen, 3, 4, 12, 10);
+                    g.DrawLine(pen, 3, 7, 15, 7);
+                    g.DrawLine(pen, 6, 10, 12, 10);
+                }
+                else if (key == "settings")
+                {
+                    g.DrawEllipse(pen, 6, 6, 6, 6);
+                    for (int i = 0; i < 8; i++)
+                    {
+                        double a = Math.PI * i / 4D;
+                        float x1 = 9 + (float)Math.Cos(a) * 5F;
+                        float y1 = 9 + (float)Math.Sin(a) * 5F;
+                        float x2 = 9 + (float)Math.Cos(a) * 7F;
+                        float y2 = 9 + (float)Math.Sin(a) * 7F;
+                        g.DrawLine(pen, x1, y1, x2, y2);
+                    }
+                }
+                else if (key == "profile")
+                {
+                    g.DrawRectangle(pen, 4, 3, 10, 12);
+                    g.DrawLine(pen, 6, 7, 12, 7);
+                    g.DrawLine(pen, 6, 10, 12, 10);
+                }
+                else if (key == "refresh")
+                {
+                    g.DrawArc(pen, 4, 4, 10, 10, 35, 260);
+                    g.DrawLine(pen, 12, 4, 14, 4);
+                    g.DrawLine(pen, 14, 4, 14, 6);
+                }
+                else if (key == "list")
+                {
+                    g.FillEllipse(brush, 4, 5, 2, 2);
+                    g.FillEllipse(brush, 4, 8, 2, 2);
+                    g.FillEllipse(brush, 4, 11, 2, 2);
+                    g.DrawLine(pen, 8, 6, 14, 6);
+                    g.DrawLine(pen, 8, 9, 14, 9);
+                    g.DrawLine(pen, 8, 12, 14, 12);
+                }
+                else if (key == "edit")
+                {
+                    g.DrawLine(pen, 5, 13, 12, 6);
+                    g.DrawLine(pen, 11, 5, 13, 7);
+                    g.DrawLine(pen, 4, 14, 7, 13);
+                }
+                else if (key == "download")
+                {
+                    g.DrawLine(pen, 9, 4, 9, 11);
+                    g.DrawLine(pen, 6, 8, 9, 11);
+                    g.DrawLine(pen, 12, 8, 9, 11);
+                    g.DrawLine(pen, 5, 14, 13, 14);
+                }
+                else if (key == "startup")
+                {
+                    g.DrawEllipse(pen, 4, 4, 10, 10);
+                    g.DrawLine(pen, 9, 9, 9, 5);
+                    g.DrawLine(pen, 9, 9, 12, 10);
+                }
+                else if (key == "power")
+                {
+                    g.DrawArc(pen, 4, 5, 10, 10, 130, 280);
+                    g.DrawLine(pen, 9, 3, 9, 9);
+                }
+                else if (key == "exit")
+                {
+                    g.DrawRectangle(pen, 4, 4, 7, 10);
+                    g.DrawLine(pen, 9, 9, 15, 9);
+                    g.DrawLine(pen, 12, 6, 15, 9);
+                    g.DrawLine(pen, 12, 12, 15, 9);
+                }
+                else
+                {
+                    g.FillEllipse(brush, 6, 6, 6, 6);
+                }
+            }
+
+            return bmp;
+        }
     }
 
-    class CleanMenuRenderer : ToolStripProfessionalRenderer
+    class TelegramMenuRenderer : ToolStripProfessionalRenderer
     {
-        public CleanMenuRenderer() : base(new CleanMenuColorTable()) { }
+        public TelegramMenuRenderer() : base(new TelegramMenuColorTable()) { }
 
-        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
         {
-            Rectangle rect = new Rectangle(4, 1, e.Item.Width - 8, e.Item.Height - 2);
-            Color fill = e.Item.Selected && e.Item.Enabled ? UiStyles.HoverBack : UiStyles.PanelBack;
-            using (var brush = new SolidBrush(fill))
-            using (var path = RoundedRect(rect, 4))
+            Rectangle rect = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+            using (var brush = new SolidBrush(UiStyles.PanelBack))
+            using (var path = UiStyles.RoundedRect(rect, 10))
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 e.Graphics.FillPath(brush, path);
             }
         }
 
+        protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
+        {
+            Rectangle rect = new Rectangle(Point.Empty, e.ToolStrip.Size);
+            using (var brush = new SolidBrush(UiStyles.PanelBack))
+                e.Graphics.FillRectangle(brush, rect);
+        }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            Rectangle rect = new Rectangle(4, 1, Math.Max(1, e.Item.Width - 8), Math.Max(1, e.Item.Height - 2));
+            Color fill = e.Item.Selected && e.Item.Enabled ? UiStyles.HoverBack : UiStyles.PanelBack;
+            using (var brush = new SolidBrush(fill))
+            using (var path = UiStyles.RoundedRect(rect, 7))
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                e.Graphics.FillPath(brush, path);
+            }
+        }
+
+        protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
+        {
+            if (e.Image == null)
+                return;
+
+            Rectangle rect = e.ImageRectangle;
+            rect = new Rectangle(rect.Left + 1, rect.Top + 1, 18, 18);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.DrawImage(e.Image, rect);
+        }
+
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
-            e.TextColor = e.Item.Enabled ? UiStyles.Text : UiStyles.MutedText;
+            e.TextColor = UiStyles.MenuTextColor(e.Item);
             base.OnRenderItemText(e);
         }
 
         protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e)
         {
-            e.ArrowColor = e.Item.Enabled ? UiStyles.MutedText : UiStyles.Border;
+            e.ArrowColor = e.Item.Enabled ? UiStyles.IconText : UiStyles.Border;
             base.OnRenderArrow(e);
         }
 
         protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
         {
-            Rectangle rect = e.ImageRectangle;
-            int midY = rect.Top + rect.Height / 2;
+            if (e.Image != null)
+            {
+                Rectangle rect = e.ImageRectangle;
+                rect = new Rectangle(rect.Left + 1, rect.Top + 1, 18, 18);
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                e.Graphics.DrawImage(e.Image, rect);
+                return;
+            }
+
+            Rectangle markRect = e.ImageRectangle;
+            int midY = markRect.Top + markRect.Height / 2;
             Point[] points = new Point[]
             {
-                new Point(rect.Left + 3, midY),
-                new Point(rect.Left + 7, midY + 4),
-                new Point(rect.Right - 3, rect.Top + 4)
+                new Point(markRect.Left + 3, midY),
+                new Point(markRect.Left + 7, midY + 4),
+                new Point(markRect.Right - 3, markRect.Top + 4)
             };
-
             using (var pen = new Pen(UiStyles.Accent, 2F))
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -2882,37 +3225,30 @@ namespace MihomoTray
         {
             int y = e.Item.Height / 2;
             using (var pen = new Pen(UiStyles.Border))
-                e.Graphics.DrawLine(pen, 12, y, e.Item.Width - 12, y);
+                e.Graphics.DrawLine(pen, 36, y, e.Item.Width - 14, y);
         }
 
-        static GraphicsPath RoundedRect(Rectangle bounds, int radius)
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
         {
-            int diameter = radius * 2;
-            var path = new GraphicsPath();
-            if (diameter <= 0)
+            Rectangle rect = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+            using (var pen = new Pen(UiStyles.Border))
+            using (var path = UiStyles.RoundedRect(rect, 10))
             {
-                path.AddRectangle(bounds);
-                return path;
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                e.Graphics.DrawPath(pen, path);
             }
-
-            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-            path.CloseFigure();
-            return path;
         }
     }
 
-    class CleanMenuColorTable : ProfessionalColorTable
+    class TelegramMenuColorTable : ProfessionalColorTable
     {
         public override Color ToolStripDropDownBackground { get { return UiStyles.PanelBack; } }
         public override Color ImageMarginGradientBegin { get { return UiStyles.PanelBack; } }
         public override Color ImageMarginGradientMiddle { get { return UiStyles.PanelBack; } }
         public override Color ImageMarginGradientEnd { get { return UiStyles.PanelBack; } }
-        public override Color MenuItemSelected { get { return Color.FromArgb(229, 240, 255); } }
+        public override Color MenuItemSelected { get { return UiStyles.HoverBack; } }
         public override Color MenuBorder { get { return UiStyles.Border; } }
-        public override Color MenuItemBorder { get { return Color.FromArgb(191, 219, 254); } }
+        public override Color MenuItemBorder { get { return UiStyles.HoverBack; } }
     }
 
     class PanelSettingsForm : Form
