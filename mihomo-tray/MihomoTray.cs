@@ -2839,8 +2839,8 @@ namespace MihomoTray
 
                 try
                 {
-                    Point itemTopRight = owner.PointToScreen(new Point(item.Bounds.Right - 2, item.Bounds.Top - 6));
-                    Point itemTopLeft = owner.PointToScreen(new Point(item.Bounds.Left - dropDown.Width + 2, item.Bounds.Top - 6));
+                    Point itemTopRight = owner.PointToScreen(new Point(owner.Width - 1, item.Bounds.Top - 6));
+                    Point itemTopLeft = owner.PointToScreen(new Point(-dropDown.Width + 1, item.Bounds.Top - 6));
                     Rectangle screen = Screen.FromPoint(itemTopRight).WorkingArea;
                     Point target = itemTopRight;
 
@@ -3276,7 +3276,7 @@ namespace MihomoTray
 
         static Rectangle IconRectangle(ToolStripItem item)
         {
-            int top = (item.Height - IconSize) / 2;
+            int top = ((item.Height - IconSize) / 2) + 2;
             return new Rectangle(IconLeft, top, IconSize, IconSize);
         }
     }
