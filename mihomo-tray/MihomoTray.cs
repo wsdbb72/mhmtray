@@ -2764,12 +2764,12 @@ namespace MihomoTray
 
                 item.AutoSize = true;
                 item.Margin = new Padding(5, 1, 5, 1);
-                item.Padding = new Padding(6, 5, 18, 5);
+                item.Padding = new Padding(6, 6, 18, 6);
 
                 ToolStripMenuItem menuItem = item as ToolStripMenuItem;
                 if (menuItem != null && menuItem.HasDropDownItems)
                 {
-                    menuItem.Padding = new Padding(6, 5, 26, 5);
+                    menuItem.Padding = new Padding(6, 6, 26, 6);
                     PrepareMenuSurface(menuItem.DropDown);
                     ApplyMenuItems(menuItem.DropDown);
                 }
@@ -2976,7 +2976,7 @@ namespace MihomoTray
 
         static Font CreateFont(float size, FontStyle style)
         {
-            string[] names = new string[] { "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", SystemFonts.MessageBoxFont.FontFamily.Name };
+            string[] names = new string[] { "MiSans", "Noto Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", SystemFonts.MessageBoxFont.FontFamily.Name };
             string familyName = names[names.Length - 1];
 
             try
@@ -3140,6 +3140,11 @@ namespace MihomoTray
 
     class TelegramMenuRenderer : ToolStripProfessionalRenderer
     {
+        const int IconLeft = 17;
+        const int IconSize = 18;
+        const int TextLeft = 46;
+        const int TextRightPadding = 28;
+
         public TelegramMenuRenderer() : base(new TelegramMenuColorTable()) { }
 
         protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
@@ -3177,16 +3182,29 @@ namespace MihomoTray
             if (e.Image == null)
                 return;
 
-            Rectangle rect = e.ImageRectangle;
-            rect = new Rectangle(rect.Left + 1, rect.Top + 1, 18, 18);
+            Rectangle rect = IconRectangle(e.Item);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.DrawImage(e.Image, rect);
         }
 
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
-            e.TextColor = UiStyles.MenuTextColor(e.Item);
-            base.OnRenderItemText(e);
+            if (string.IsNullOrEmpty(e.Text))
+                return;
+
+            e.Graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
+            Color color = UiStyles.MenuTextColor(e.Item);
+            RectangleF rect = TextRectangle(e.Graphics, e.Item, e.Text, e.TextFont);
+            using (var brush = new SolidBrush(color))
+            using (var format = new StringFormat())
+            {
+                format.Alignment = StringAlignment.Near;
+                format.LineAlignment = StringAlignment.Center;
+                format.Trimming = StringTrimming.EllipsisCharacter;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+                e.Graphics.DrawString(e.Text, e.TextFont, brush, rect, format);
+            }
         }
 
         protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e)
@@ -3199,8 +3217,7 @@ namespace MihomoTray
         {
             if (e.Image != null)
             {
-                Rectangle rect = e.ImageRectangle;
-                rect = new Rectangle(rect.Left + 1, rect.Top + 1, 18, 18);
+                Rectangle rect = IconRectangle(e.Item);
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 e.Graphics.DrawImage(e.Image, rect);
                 return;
@@ -3237,6 +3254,21 @@ namespace MihomoTray
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 e.Graphics.DrawPath(pen, path);
             }
+        }
+
+        static Rectangle IconRectangle(ToolStripItem item)
+        {
+            int top = (item.Height - IconSize) / 2;
+            return new Rectangle(IconLeft, top, IconSize, IconSize);
+        }
+
+        static RectangleF TextRectangle(Graphics g, ToolStripItem item, string text, Font font)
+        {
+            int availableWidth = Math.Max(20, item.Width - TextLeft - TextRightPadding);
+            SizeF measured = g.MeasureString(text, font, availableWidth, StringFormat.GenericTypographic);
+            float height = Math.Min(item.Height, Math.Max(font.GetHeight(g), measured.Height));
+            float top = (item.Height - height) / 2F + 0.5F;
+            return new RectangleF(TextLeft, top, availableWidth, height);
         }
     }
 
