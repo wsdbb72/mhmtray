@@ -166,6 +166,7 @@ namespace MihomoTray
         const int AssetDownloadTimeoutMilliseconds = 180000;
         const int AssetRetryDelayMilliseconds = 800;
         const int AssetProxyProbeTimeoutMilliseconds = 800;
+        const int AssetDownloadRouteAttempts = 3;
         const int SubscriptionDirectTimeoutMilliseconds = 8000;
         const int SubscriptionProxyTimeoutMilliseconds = 30000;
 
@@ -2683,17 +2684,7 @@ namespace MihomoTray
 
             try
             {
-                using (var stream = OpenUpdateResponseStream(url, false))
-                using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    byte[] buf = new byte[64 * 1024];
-                    int read;
-                    while ((read = stream.Read(buf, 0, buf.Length)) > 0)
-                        fs.Write(buf, 0, read);
-                }
-
-                if (!File.Exists(tempFile) || new FileInfo(tempFile).Length == 0)
-                    throw new Exception("下载文件为空");
+                DownloadUpdateFileWithRetry(url, tempFile);
 
                 if (compressed)
                 {
@@ -2805,6 +2796,75 @@ namespace MihomoTray
             using (var reader = new StreamReader(stream, Encoding.UTF8))
             {
                 return reader.ReadToEnd();
+            }
+        }
+
+        void DownloadUpdateFileWithRetry(string url, string tempFile)
+        {
+            var errors = new StringBuilder();
+            List<UpdateRequestRoute> routes = BuildUpdateRequestRoutes();
+
+            foreach (UpdateRequestRoute route in routes)
+            {
+                int attempts = route.Attempts;
+                if (attempts < AssetDownloadRouteAttempts && route.Proxy != null)
+                    attempts = AssetDownloadRouteAttempts;
+
+                for (int attempt = 1; attempt <= attempts; attempt++)
+                {
+                    try
+                    {
+                        try { File.Delete(tempFile); } catch { }
+                        DownloadUpdateFileOnce(url, tempFile, route.Proxy);
+
+                        if (!File.Exists(tempFile) || new FileInfo(tempFile).Length == 0)
+                            throw new Exception("下载文件为空");
+
+                        return;
+                    }
+                    catch (WebException ex)
+                    {
+                        string message = DescribeUpdateWebException(ex);
+                        errors.Append(route.Name).Append(" 第 ").Append(attempt).Append(" 次: ")
+                            .Append(message).Append("\r\n");
+                    }
+                    catch (Exception ex)
+                    {
+                        errors.Append(route.Name).Append(" 第 ").Append(attempt).Append(" 次: ")
+                            .Append(ex.Message).Append("\r\n");
+                    }
+
+                    try { File.Delete(tempFile); } catch { }
+                    if (attempt < attempts)
+                        System.Threading.Thread.Sleep(AssetRetryDelayMilliseconds);
+                }
+            }
+
+            throw new Exception("下载文件失败，已尝试系统代理、本程序代理和直连。\r\n" + errors.ToString().TrimEnd());
+        }
+
+        void DownloadUpdateFileOnce(string url, string tempFile, IWebProxy proxy)
+        {
+            var request = CreateUpdateRequest(url, false, proxy);
+            using (var response = (HttpWebResponse)request.GetResponse())
+            using (var stream = response.GetResponseStream())
+            using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                if (stream == null)
+                    throw new IOException("响应流为空");
+
+                byte[] buf = new byte[64 * 1024];
+                long totalRead = 0;
+                int read;
+                while ((read = stream.Read(buf, 0, buf.Length)) > 0)
+                {
+                    fs.Write(buf, 0, read);
+                    totalRead += read;
+                }
+
+                long expectedLength = response.ContentLength;
+                if (expectedLength > 0 && totalRead != expectedLength)
+                    throw new IOException("下载不完整: " + totalRead + "/" + expectedLength + " bytes");
             }
         }
 
