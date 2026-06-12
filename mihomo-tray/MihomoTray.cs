@@ -159,14 +159,25 @@ namespace MihomoTray
         [DllImport("iphlpapi.dll", SetLastError = true)]
         static extern int GetBestInterface(uint dwDestAddr, out uint pdwBestIfIndex);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, StringBuilder lpExeName, ref int lpdwSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr hObject);
+
         const int INTERNET_OPTION_SETTINGS_CHANGED = 39;
         const int INTERNET_OPTION_REFRESH = 37;
+        const int PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         const int SystemProxyCacheMilliseconds = 1500;
         const int AssetApiTimeoutMilliseconds = 45000;
         const int AssetDownloadTimeoutMilliseconds = 180000;
         const int AssetRetryDelayMilliseconds = 800;
         const int AssetProxyProbeTimeoutMilliseconds = 800;
         const int AssetDownloadRouteAttempts = 3;
+        const int MihomoStopTimeoutMilliseconds = 8000;
         const int SubscriptionDirectTimeoutMilliseconds = 8000;
         const int SubscriptionProxyTimeoutMilliseconds = 30000;
 
@@ -1050,36 +1061,199 @@ namespace MihomoTray
 
         Process FindMihomoProcess()
         {
+            List<Process> processes = FindManagedMihomoProcesses();
+            if (processes.Count == 0)
+                return null;
+
+            Process first = processes[0];
+            for (int i = 1; i < processes.Count; i++)
+            {
+                try { processes[i].Dispose(); } catch { }
+            }
+            return first;
+        }
+
+        List<Process> FindManagedMihomoProcesses()
+        {
+            var result = new List<Process>();
+            var seen = new List<int>();
             string[] names = { "mihomo", "mihomo-alpha", "clash-meta", "Clash.Meta" };
             foreach (string name in names)
             {
                 var procs = Process.GetProcessesByName(name);
                 foreach (var p in procs)
                 {
-                    if (IsManagedMihomoProcess(p))
-                        return p;
+                    bool keep = false;
+                    try
+                    {
+                        if (!p.HasExited && !seen.Contains(p.Id) && IsKnownMihomoProcess(p))
+                        {
+                            result.Add(p);
+                            seen.Add(p.Id);
+                            keep = true;
+                        }
+                    }
+                    catch { }
 
-                    try { p.Dispose(); } catch { }
+                    if (!keep)
+                    {
+                        try { p.Dispose(); } catch { }
+                    }
                 }
             }
-            return null;
+            return result;
         }
 
         void KillMihomo()
         {
+            string details;
+            StopManagedMihomoProcesses(MihomoStopTimeoutMilliseconds, out details);
+        }
+
+        bool StopManagedMihomoProcesses(int timeoutMilliseconds, out string details)
+        {
+            details = "";
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+
+            while (DateTime.UtcNow <= deadline)
+            {
+                List<Process> processes = FindManagedMihomoProcesses();
+                if (processes.Count == 0)
+                {
+                    ClearMihomoProcessCache();
+                    return true;
+                }
+
+                foreach (Process process in processes)
+                    RequestMihomoProcessExit(process);
+
+                DisposeProcesses(processes);
+
+                int remaining = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                if (remaining <= 0)
+                    break;
+
+                System.Threading.Thread.Sleep(Math.Min(250, remaining));
+            }
+
+            List<Process> alive = FindManagedMihomoProcesses();
+            if (alive.Count == 0)
+            {
+                ClearMihomoProcessCache();
+                return true;
+            }
+
+            details = DescribeMihomoProcesses(alive);
+            DisposeProcesses(alive);
+            ClearMihomoProcessCache();
+            return false;
+        }
+
+        void RequestMihomoProcessExit(Process process)
+        {
             try
             {
-                if (_mihomoProcess != null)
+                if (process == null || process.HasExited)
+                    return;
+
+                bool closed = false;
+                try
                 {
-                    try
-                    {
-                        if (!_mihomoProcess.HasExited && IsManagedMihomoProcess(_mihomoProcess))
-                            _mihomoProcess.Kill();
-                    }
-                    catch { }
+                    if (process.MainWindowHandle != IntPtr.Zero)
+                        closed = process.CloseMainWindow();
                 }
+                catch { }
+
+                try
+                {
+                    if (closed && process.WaitForExit(1500))
+                        return;
+                }
+                catch { }
+
+                try
+                {
+                    if (!process.HasExited)
+                        process.Kill();
+                }
+                catch { }
+
+                try { process.WaitForExit(1500); } catch { }
             }
             catch { }
+        }
+
+        string DescribeMihomoProcesses(List<Process> processes)
+        {
+            var sb = new StringBuilder();
+            foreach (Process process in processes)
+            {
+                if (sb.Length > 0)
+                    sb.Append("; ");
+
+                try
+                {
+                    sb.Append(process.ProcessName).Append(" PID ").Append(process.Id);
+                    string path = GetProcessPath(process);
+                    if (!string.IsNullOrEmpty(path))
+                        sb.Append(" (").Append(path).Append(")");
+                }
+                catch
+                {
+                    sb.Append("PID 未知");
+                }
+            }
+            return sb.ToString();
+        }
+
+        string GetProcessPath(Process process)
+        {
+            try
+            {
+                string path = process.MainModule.FileName;
+                if (!string.IsNullOrEmpty(path))
+                    return path;
+            }
+            catch { }
+
+            return GetProcessImagePath(process);
+        }
+
+        string GetProcessImagePath(Process process)
+        {
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process.Id);
+                if (handle == IntPtr.Zero)
+                    return "";
+
+                int capacity = 1024;
+                var path = new StringBuilder(capacity);
+                if (QueryFullProcessImageName(handle, 0, path, ref capacity))
+                    return path.ToString();
+            }
+            catch { }
+            finally
+            {
+                if (handle != IntPtr.Zero)
+                    CloseHandle(handle);
+            }
+
+            return "";
+        }
+
+        void DisposeProcesses(List<Process> processes)
+        {
+            foreach (Process process in processes)
+            {
+                try { process.Dispose(); } catch { }
+            }
+        }
+
+        void ClearMihomoProcessCache()
+        {
+            _lastMihomoProcessLookupUtc = DateTime.MinValue;
 
             if (_mihomoProcess != null)
             {
@@ -1095,8 +1269,31 @@ namespace MihomoTray
                 if (process == null)
                     return false;
 
-                string processPath = process.MainModule.FileName;
+                string processPath = GetProcessPath(process);
                 return PathsEqual(processPath, _mihomoExePath) || IsPathInsideBasePath(processPath);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        bool IsKnownMihomoProcess(Process process)
+        {
+            if (IsCachedMihomoProcess(process))
+                return true;
+
+            return IsManagedMihomoProcess(process);
+        }
+
+        bool IsCachedMihomoProcess(Process process)
+        {
+            try
+            {
+                if (process == null || _mihomoProcess == null)
+                    return false;
+
+                return process.Id == _mihomoProcess.Id;
             }
             catch
             {
@@ -1696,20 +1893,24 @@ namespace MihomoTray
                                         return;
 
                                     bool stoppedForReplace = true;
+                                    string stopDetails = "";
                                     self.Invoke(new Action(delegate
                                     {
                                         _lastMihomoProcessLookupUtc = DateTime.MinValue;
                                         wasRunning = IsMihomoRunning();
                                         if (wasRunning)
                                         {
-                                            StopMihomo();
-                                            _lastMihomoProcessLookupUtc = DateTime.MinValue;
-                                            stoppedForReplace = !IsMihomoRunning();
+                                            stoppedForReplace = StopManagedMihomoProcesses(MihomoStopTimeoutMilliseconds, out stopDetails);
                                         }
                                     }));
 
                                     if (!stoppedForReplace)
-                                        throw new Exception("mihomo.exe 仍在运行，无法替换核心");
+                                    {
+                                        string message = "mihomo.exe 仍在运行，无法替换核心";
+                                        if (!string.IsNullOrEmpty(stopDetails))
+                                            message += ": " + stopDetails;
+                                        throw new Exception(message);
+                                    }
 
                                     coreStopped = wasRunning;
                                     if (wasRunning)
@@ -1992,8 +2193,18 @@ namespace MihomoTray
         {
             try
             {
-                KillMihomo();
-                _trayIcon.ShowBalloonTip(2000, "Mihomo", "已停止", ToolTipIcon.Info);
+                string details;
+                if (StopManagedMihomoProcesses(MihomoStopTimeoutMilliseconds, out details))
+                {
+                    _trayIcon.ShowBalloonTip(2000, "Mihomo", "已停止", ToolTipIcon.Info);
+                }
+                else
+                {
+                    string message = "仍有 mihomo.exe 在运行";
+                    if (!string.IsNullOrEmpty(details))
+                        message += ": " + details;
+                    _trayIcon.ShowBalloonTip(3000, "Mihomo", message, ToolTipIcon.Warning);
+                }
             }
             catch (Exception ex)
             {
