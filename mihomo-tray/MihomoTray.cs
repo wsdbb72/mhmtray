@@ -2720,11 +2720,18 @@ namespace MihomoTray
         const int AW_HIDE = 0x00010000;
         const int AW_ACTIVATE = 0x00020000;
         const int AW_BLEND = 0x00080000;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_NOACTIVATE = 0x0010;
+        const uint SWP_SHOWWINDOW = 0x0040;
 
         static readonly Dictionary<string, Image> IconCache = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
 
         [DllImport("user32.dll")]
         static extern bool AnimateWindow(IntPtr hWnd, int dwTime, int dwFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
 
         public static readonly Color WindowBack = Color.FromArgb(244, 247, 250);
         public static readonly Color PanelBack = Color.White;
@@ -2832,32 +2839,55 @@ namespace MihomoTray
             item.Tag = "submenu-positioned";
             EventHandler reposition = delegate
             {
-                ToolStrip owner = item.Owner;
-                ToolStripDropDown dropDown = item.DropDown;
-                if (owner == null || dropDown == null)
-                    return;
-
-                try
-                {
-                    Point itemTopRight = owner.PointToScreen(new Point(owner.Width - 1, item.Bounds.Top - 6));
-                    Point itemTopLeft = owner.PointToScreen(new Point(-dropDown.Width + 1, item.Bounds.Top - 6));
-                    Rectangle screen = Screen.FromPoint(itemTopRight).WorkingArea;
-                    Point target = itemTopRight;
-
-                    if (target.X + dropDown.Width > screen.Right)
-                        target = itemTopLeft;
-
-                    if (target.Y + dropDown.Height > screen.Bottom)
-                        target.Y = Math.Max(screen.Top, screen.Bottom - dropDown.Height);
-                    if (target.Y < screen.Top)
-                        target.Y = screen.Top;
-
-                    dropDown.Location = target;
-                }
-                catch { }
+                PositionSubMenu(item);
             };
             item.DropDownOpening += reposition;
-            item.DropDownOpened += reposition;
+            item.DropDownOpened += delegate
+            {
+                PositionSubMenu(item);
+                ToolStrip owner = item.Owner;
+                if (owner != null && !owner.IsDisposed)
+                {
+                    try
+                    {
+                        owner.BeginInvoke((MethodInvoker)delegate { PositionSubMenu(item); });
+                        owner.BeginInvoke((MethodInvoker)delegate { PositionSubMenu(item); });
+                    }
+                    catch { }
+                }
+            };
+        }
+
+        static void PositionSubMenu(ToolStripMenuItem item)
+        {
+            ToolStrip owner = item.Owner;
+            ToolStripDropDown dropDown = item.DropDown;
+            if (owner == null || dropDown == null)
+                return;
+
+            try
+            {
+                const int horizontalOverlap = 6;
+                const int verticalLift = 6;
+
+                Point itemTopRight = owner.PointToScreen(new Point(item.Bounds.Right - horizontalOverlap, item.Bounds.Top - verticalLift));
+                Point itemTopLeft = owner.PointToScreen(new Point(item.Bounds.Left - dropDown.Width + horizontalOverlap, item.Bounds.Top - verticalLift));
+                Rectangle screen = Screen.FromPoint(itemTopRight).WorkingArea;
+                Point target = itemTopRight;
+
+                if (target.X + dropDown.Width > screen.Right)
+                    target = itemTopLeft;
+
+                if (target.Y + dropDown.Height > screen.Bottom)
+                    target.Y = Math.Max(screen.Top, screen.Bottom - dropDown.Height);
+                if (target.Y < screen.Top)
+                    target.Y = screen.Top;
+
+                dropDown.Location = target;
+                if (dropDown.Handle != IntPtr.Zero)
+                    SetWindowPos(dropDown.Handle, IntPtr.Zero, target.X, target.Y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+            catch { }
         }
 
         static void UpdateRoundedRegion(ToolStrip menu)
@@ -3222,6 +3252,7 @@ namespace MihomoTray
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
             e.TextColor = UiStyles.MenuTextColor(e.Item);
+            e.TextRectangle = new Rectangle(e.TextRectangle.X, e.TextRectangle.Y + 1, e.TextRectangle.Width, e.TextRectangle.Height);
             base.OnRenderItemText(e);
         }
 
@@ -3276,7 +3307,7 @@ namespace MihomoTray
 
         static Rectangle IconRectangle(ToolStripItem item)
         {
-            int top = ((item.Height - IconSize) / 2) + 2;
+            int top = Math.Max(0, (item.Height - IconSize) / 2);
             return new Rectangle(IconLeft, top, IconSize, IconSize);
         }
     }
