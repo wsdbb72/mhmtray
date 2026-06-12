@@ -181,9 +181,9 @@ namespace MihomoTray
             _trayIcon = new NotifyIcon();
             _trayIcon.Visible = true;
 
-            _iconRunning = CreateStatusLightIcon(Color.FromArgb(52, 199, 89), Color.FromArgb(36, 146, 68));
-            _iconStopped = CreateStatusLightIcon(Color.FromArgb(151, 160, 168), Color.FromArgb(112, 121, 128));
-            _iconWarn = CreateStatusLightIcon(Color.FromArgb(52, 199, 89), Color.FromArgb(36, 146, 68));
+            _iconRunning = IconFromBase64(EmbeddedIcons.OnBase64);
+            _iconStopped = IconFromBase64(EmbeddedIcons.OffBase64);
+            _iconWarn = IconFromBase64(EmbeddedIcons.WarnBase64);
 
             BuildMenu();
             LoadTrayConfig();
@@ -2644,24 +2644,19 @@ namespace MihomoTray
 
         Icon CreateFallbackIcon(Color color)
         {
-            return CreateStatusLightIcon(color, Color.FromArgb(105, 105, 105));
-        }
-
-        Icon CreateStatusLightIcon(Color fill, Color border)
-        {
             int size = 32;
             var bmp = new Bitmap(size, size);
             using (var g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.Clear(Color.Transparent);
-                using (var brush = new SolidBrush(fill))
+                using (var brush = new SolidBrush(color))
                 {
-                    g.FillEllipse(brush, 5, 5, 22, 22);
+                    g.FillEllipse(brush, 4, 4, 24, 24);
                 }
-                using (var pen = new Pen(border, 1.4f))
+                using (var pen = new Pen(Color.FromArgb(60, 0, 0, 0), 1.5f))
                 {
-                    g.DrawEllipse(pen, 5, 5, 22, 22);
+                    g.DrawEllipse(pen, 4, 4, 24, 24);
                 }
             }
             using (bmp)
@@ -3074,133 +3069,31 @@ namespace MihomoTray
         static Image CreateMenuIcon(string key, bool active)
         {
             var bmp = new Bitmap(18, 18);
-            Color color = active ? Accent : IconText;
+            Color fill = active ? ActiveGreen : IconText;
+            Color border = active ? Color.FromArgb(31, 153, 71) : Color.FromArgb(102, 116, 128);
             if (string.Equals(key, "exit", StringComparison.OrdinalIgnoreCase))
-                color = Danger;
+            {
+                fill = Danger;
+                border = Color.FromArgb(180, 42, 38);
+            }
             if (string.Equals(key, "status-on", StringComparison.OrdinalIgnoreCase))
-                color = ActiveGreen;
+            {
+                fill = ActiveGreen;
+                border = Color.FromArgb(31, 153, 71);
+            }
             if (string.Equals(key, "status-off", StringComparison.OrdinalIgnoreCase))
-                color = MutedText;
+            {
+                fill = MutedText;
+                border = Color.FromArgb(112, 112, 112);
+            }
 
             using (Graphics g = Graphics.FromImage(bmp))
-            using (Pen pen = new Pen(color, 1.65F))
-            using (SolidBrush brush = new SolidBrush(color))
+            using (Pen pen = new Pen(border, 1.15F))
+            using (SolidBrush brush = new SolidBrush(fill))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-                pen.StartCap = LineCap.Round;
-                pen.EndCap = LineCap.Round;
-                pen.LineJoin = LineJoin.Round;
-
-                if (key == "status-on" || key == "status-off" || key == "empty")
-                {
-                    g.FillEllipse(brush, 6, 6, 6, 6);
-                }
-                else if (key == "play")
-                {
-                    Point[] pts = new Point[] { new Point(7, 4), new Point(14, 9), new Point(7, 14) };
-                    g.FillPolygon(brush, pts);
-                }
-                else if (key == "stop")
-                {
-                    g.FillRectangle(brush, 5, 5, 8, 8);
-                }
-                else if (key == "proxy")
-                {
-                    g.DrawEllipse(pen, 3, 3, 12, 12);
-                    g.DrawLine(pen, 3, 9, 15, 9);
-                    g.DrawArc(pen, 5, 3, 8, 12, 90, 180);
-                    g.DrawArc(pen, 5, 3, 8, 12, 270, 180);
-                }
-                else if (key == "tun")
-                {
-                    Point[] pts = new Point[] { new Point(9, 3), new Point(14, 5), new Point(13, 11), new Point(9, 15), new Point(5, 11), new Point(4, 5) };
-                    g.DrawPolygon(pen, pts);
-                    g.DrawLine(pen, 7, 9, 9, 11);
-                    g.DrawLine(pen, 9, 11, 12, 7);
-                }
-                else if (key == "guard")
-                {
-                    Point[] pts = new Point[] { new Point(9, 3), new Point(14, 5), new Point(13, 11), new Point(9, 15), new Point(5, 11), new Point(4, 5) };
-                    g.DrawPolygon(pen, pts);
-                    g.DrawLine(pen, 7, 9, 9, 11);
-                    g.DrawLine(pen, 9, 11, 12, 7);
-                }
-                else if (key == "panel")
-                {
-                    g.DrawRectangle(pen, 3, 4, 12, 10);
-                    g.DrawLine(pen, 3, 7, 15, 7);
-                    g.DrawLine(pen, 6, 10, 12, 10);
-                }
-                else if (key == "settings")
-                {
-                    g.DrawEllipse(pen, 6, 6, 6, 6);
-                    for (int i = 0; i < 8; i++)
-                    {
-                        double a = Math.PI * i / 4D;
-                        float x1 = 9 + (float)Math.Cos(a) * 5F;
-                        float y1 = 9 + (float)Math.Sin(a) * 5F;
-                        float x2 = 9 + (float)Math.Cos(a) * 7F;
-                        float y2 = 9 + (float)Math.Sin(a) * 7F;
-                        g.DrawLine(pen, x1, y1, x2, y2);
-                    }
-                }
-                else if (key == "profile")
-                {
-                    g.DrawRectangle(pen, 4, 3, 10, 12);
-                    g.DrawLine(pen, 6, 7, 12, 7);
-                    g.DrawLine(pen, 6, 10, 12, 10);
-                }
-                else if (key == "refresh")
-                {
-                    g.DrawArc(pen, 4, 4, 10, 10, 35, 260);
-                    g.DrawLine(pen, 12, 4, 14, 4);
-                    g.DrawLine(pen, 14, 4, 14, 6);
-                }
-                else if (key == "list")
-                {
-                    g.FillEllipse(brush, 4, 5, 2, 2);
-                    g.FillEllipse(brush, 4, 8, 2, 2);
-                    g.FillEllipse(brush, 4, 11, 2, 2);
-                    g.DrawLine(pen, 8, 6, 14, 6);
-                    g.DrawLine(pen, 8, 9, 14, 9);
-                    g.DrawLine(pen, 8, 12, 14, 12);
-                }
-                else if (key == "edit")
-                {
-                    g.DrawLine(pen, 5, 13, 12, 6);
-                    g.DrawLine(pen, 11, 5, 13, 7);
-                    g.DrawLine(pen, 4, 14, 7, 13);
-                }
-                else if (key == "download")
-                {
-                    g.DrawLine(pen, 9, 4, 9, 11);
-                    g.DrawLine(pen, 6, 8, 9, 11);
-                    g.DrawLine(pen, 12, 8, 9, 11);
-                    g.DrawLine(pen, 5, 14, 13, 14);
-                }
-                else if (key == "startup")
-                {
-                    g.DrawEllipse(pen, 4, 4, 10, 10);
-                    g.DrawLine(pen, 9, 9, 9, 5);
-                    g.DrawLine(pen, 9, 9, 12, 10);
-                }
-                else if (key == "power")
-                {
-                    g.DrawArc(pen, 4, 5, 10, 10, 130, 280);
-                    g.DrawLine(pen, 9, 3, 9, 9);
-                }
-                else if (key == "exit")
-                {
-                    g.DrawRectangle(pen, 4, 4, 7, 10);
-                    g.DrawLine(pen, 9, 9, 15, 9);
-                    g.DrawLine(pen, 12, 6, 15, 9);
-                    g.DrawLine(pen, 12, 12, 15, 9);
-                }
-                else
-                {
-                    g.FillEllipse(brush, 6, 6, 6, 6);
-                }
+                g.FillEllipse(brush, 5, 5, 8, 8);
+                g.DrawEllipse(pen, 5, 5, 8, 8);
             }
 
             return bmp;
