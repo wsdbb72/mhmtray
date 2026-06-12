@@ -3070,30 +3070,26 @@ namespace MihomoTray
         {
             var bmp = new Bitmap(18, 18);
             Color fill = active ? ActiveGreen : IconText;
-            Color border = active ? Color.FromArgb(31, 153, 71) : Color.FromArgb(102, 116, 128);
             if (string.Equals(key, "exit", StringComparison.OrdinalIgnoreCase))
             {
                 fill = Danger;
-                border = Color.FromArgb(180, 42, 38);
             }
             if (string.Equals(key, "status-on", StringComparison.OrdinalIgnoreCase))
             {
                 fill = ActiveGreen;
-                border = Color.FromArgb(31, 153, 71);
             }
             if (string.Equals(key, "status-off", StringComparison.OrdinalIgnoreCase))
             {
                 fill = MutedText;
-                border = Color.FromArgb(112, 112, 112);
             }
 
             using (Graphics g = Graphics.FromImage(bmp))
-            using (Pen pen = new Pen(border, 1.15F))
             using (SolidBrush brush = new SolidBrush(fill))
             {
+                g.Clear(Color.Transparent);
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.FillEllipse(brush, 5, 5, 8, 8);
-                g.DrawEllipse(pen, 5, 5, 8, 8);
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.FillEllipse(brush, 5.5F, 5.5F, 7.5F, 7.5F);
             }
 
             return bmp;
@@ -3150,7 +3146,7 @@ namespace MihomoTray
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
             e.TextColor = UiStyles.MenuTextColor(e.Item);
-            e.TextRectangle = new Rectangle(e.TextRectangle.X, e.TextRectangle.Y + 1, e.TextRectangle.Width, e.TextRectangle.Height);
+            e.TextRectangle = new Rectangle(e.TextRectangle.X, e.TextRectangle.Y + 3, e.TextRectangle.Width, e.TextRectangle.Height);
             base.OnRenderItemText(e);
         }
 
