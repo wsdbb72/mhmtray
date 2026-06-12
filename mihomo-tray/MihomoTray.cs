@@ -2851,11 +2851,25 @@ namespace MihomoTray
                     try
                     {
                         owner.BeginInvoke((MethodInvoker)delegate { PositionSubMenu(item); });
-                        owner.BeginInvoke((MethodInvoker)delegate { PositionSubMenu(item); });
+                        ScheduleSubMenuPosition(item, 1);
+                        ScheduleSubMenuPosition(item, 35);
                     }
                     catch { }
                 }
             };
+        }
+
+        static void ScheduleSubMenuPosition(ToolStripMenuItem item, int delay)
+        {
+            var timer = new System.Windows.Forms.Timer();
+            timer.Interval = Math.Max(1, delay);
+            timer.Tick += delegate
+            {
+                timer.Stop();
+                timer.Dispose();
+                PositionSubMenu(item);
+            };
+            timer.Start();
         }
 
         static void PositionSubMenu(ToolStripMenuItem item)
@@ -2867,19 +2881,22 @@ namespace MihomoTray
 
             try
             {
-                const int horizontalOverlap = 6;
+                const int horizontalOverlap = 2;
                 const int verticalLift = 6;
 
-                Point itemTopRight = owner.PointToScreen(new Point(item.Bounds.Right - horizontalOverlap, item.Bounds.Top - verticalLift));
-                Point itemTopLeft = owner.PointToScreen(new Point(item.Bounds.Left - dropDown.Width + horizontalOverlap, item.Bounds.Top - verticalLift));
+                int dropDownWidth = Math.Max(dropDown.Width, dropDown.GetPreferredSize(Size.Empty).Width);
+                int dropDownHeight = Math.Max(dropDown.Height, dropDown.GetPreferredSize(Size.Empty).Height);
+                Point ownerTopLeft = owner.PointToScreen(Point.Empty);
+                Point itemTopRight = new Point(ownerTopLeft.X + owner.Width - horizontalOverlap, ownerTopLeft.Y + item.Bounds.Top - verticalLift);
+                Point itemTopLeft = new Point(ownerTopLeft.X - dropDownWidth + horizontalOverlap, ownerTopLeft.Y + item.Bounds.Top - verticalLift);
                 Rectangle screen = Screen.FromPoint(itemTopRight).WorkingArea;
                 Point target = itemTopRight;
 
-                if (target.X + dropDown.Width > screen.Right)
+                if (target.X + dropDownWidth > screen.Right)
                     target = itemTopLeft;
 
-                if (target.Y + dropDown.Height > screen.Bottom)
-                    target.Y = Math.Max(screen.Top, screen.Bottom - dropDown.Height);
+                if (target.Y + dropDownHeight > screen.Bottom)
+                    target.Y = Math.Max(screen.Top, screen.Bottom - dropDownHeight);
                 if (target.Y < screen.Top)
                     target.Y = screen.Top;
 
