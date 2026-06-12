@@ -2717,23 +2717,29 @@ namespace MihomoTray
     static class UiStyles
     {
         const string MenuSurfaceTag = "telegram-menu-surface";
+        const int AW_HIDE = 0x00010000;
+        const int AW_ACTIVATE = 0x00020000;
+        const int AW_BLEND = 0x00080000;
 
         static readonly Dictionary<string, Image> IconCache = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
 
+        [DllImport("user32.dll")]
+        static extern bool AnimateWindow(IntPtr hWnd, int dwTime, int dwFlags);
+
         public static readonly Color WindowBack = Color.FromArgb(244, 247, 250);
         public static readonly Color PanelBack = Color.White;
-        public static readonly Color Border = Color.FromArgb(217, 225, 232);
-        public static readonly Color Text = Color.FromArgb(35, 40, 45);
-        public static readonly Color MutedText = Color.FromArgb(112, 126, 140);
+        public static readonly Color Border = Color.FromArgb(204, 204, 204);
+        public static readonly Color Text = Color.FromArgb(0, 0, 0);
+        public static readonly Color MutedText = Color.FromArgb(96, 96, 96);
         public static readonly Color IconText = Color.FromArgb(128, 143, 156);
         public static readonly Color Accent = Color.FromArgb(42, 171, 238);
         public static readonly Color AccentHover = Color.FromArgb(38, 152, 214);
-        public static readonly Color HoverBack = Color.FromArgb(244, 248, 251);
+        public static readonly Color HoverBack = Color.FromArgb(229, 243, 255);
         public static readonly Color Danger = Color.FromArgb(229, 57, 53);
         public static readonly Color ActiveGreen = Color.FromArgb(52, 199, 89);
-        public static readonly Font BaseFont = CreateFont(9.25F, FontStyle.Regular);
-        public static readonly Font TitleFont = CreateFont(9.25F, FontStyle.Bold);
-        public static readonly Font CaptionFont = CreateFont(8.75F, FontStyle.Regular);
+        public static readonly Font BaseFont = SystemFonts.MenuFont;
+        public static readonly Font TitleFont = new Font(SystemFonts.MenuFont, FontStyle.Bold);
+        public static readonly Font CaptionFont = SystemFonts.MenuFont;
 
         public static void ApplyMenu(ContextMenuStrip menu)
         {
@@ -2764,19 +2770,20 @@ namespace MihomoTray
 
                 item.AutoSize = true;
                 item.Margin = new Padding(5, 1, 5, 1);
-                item.Padding = new Padding(6, 6, 18, 6);
+                item.Padding = new Padding(6, 5, 18, 5);
 
                 ToolStripMenuItem menuItem = item as ToolStripMenuItem;
                 if (menuItem != null && menuItem.HasDropDownItems)
                 {
-                    menuItem.Padding = new Padding(6, 6, 26, 6);
+                    menuItem.Padding = new Padding(6, 5, 26, 5);
                     PrepareMenuSurface(menuItem.DropDown);
                     ApplyMenuItems(menuItem.DropDown);
+                    AttachTightSubMenu(menuItem);
                 }
 
                 if (IsCaption(item))
                 {
-                    item.Padding = new Padding(6, 6, 18, 6);
+                    item.Padding = new Padding(6, 5, 18, 5);
                     item.Font = CaptionFont;
                     item.ForeColor = MutedText;
                 }
@@ -2794,7 +2801,7 @@ namespace MihomoTray
 
             ToolStripDropDown dropDown = menu as ToolStripDropDown;
             if (dropDown != null)
-                dropDown.DropShadowEnabled = true;
+                dropDown.DropShadowEnabled = false;
 
             ContextMenuStrip context = menu as ContextMenuStrip;
             if (context != null)
@@ -2805,9 +2812,52 @@ namespace MihomoTray
                 menu.Tag = MenuSurfaceTag;
                 menu.SizeChanged += delegate { UpdateRoundedRegion(menu); };
                 menu.VisibleChanged += delegate { UpdateRoundedRegion(menu); };
+
+                ToolStripDropDown animatedDropDown = menu as ToolStripDropDown;
+                if (animatedDropDown != null)
+                {
+                    animatedDropDown.Opened += delegate { AnimateMenu(animatedDropDown.Handle, true); };
+                    animatedDropDown.Closing += delegate { AnimateMenu(animatedDropDown.Handle, false); };
+                }
             }
 
             UpdateRoundedRegion(menu);
+        }
+
+        static void AttachTightSubMenu(ToolStripMenuItem item)
+        {
+            if (string.Equals(item.Tag as string, "submenu-positioned", StringComparison.Ordinal))
+                return;
+
+            item.Tag = "submenu-positioned";
+            EventHandler reposition = delegate
+            {
+                ToolStrip owner = item.Owner;
+                ToolStripDropDown dropDown = item.DropDown;
+                if (owner == null || dropDown == null)
+                    return;
+
+                try
+                {
+                    Point itemTopRight = owner.PointToScreen(new Point(item.Bounds.Right - 2, item.Bounds.Top - 6));
+                    Point itemTopLeft = owner.PointToScreen(new Point(item.Bounds.Left - dropDown.Width + 2, item.Bounds.Top - 6));
+                    Rectangle screen = Screen.FromPoint(itemTopRight).WorkingArea;
+                    Point target = itemTopRight;
+
+                    if (target.X + dropDown.Width > screen.Right)
+                        target = itemTopLeft;
+
+                    if (target.Y + dropDown.Height > screen.Bottom)
+                        target.Y = Math.Max(screen.Top, screen.Bottom - dropDown.Height);
+                    if (target.Y < screen.Top)
+                        target.Y = screen.Top;
+
+                    dropDown.Location = target;
+                }
+                catch { }
+            };
+            item.DropDownOpening += reposition;
+            item.DropDownOpened += reposition;
         }
 
         static void UpdateRoundedRegion(ToolStrip menu)
@@ -2815,13 +2865,25 @@ namespace MihomoTray
             if (menu.Width <= 0 || menu.Height <= 0)
                 return;
 
-            using (var path = RoundedRect(new Rectangle(0, 0, menu.Width, menu.Height), 10))
+            using (var path = RoundedRect(new Rectangle(0, 0, menu.Width, menu.Height), 6))
             {
                 Region old = menu.Region;
                 menu.Region = new Region(path);
                 if (old != null)
                     old.Dispose();
             }
+        }
+
+        static void AnimateMenu(IntPtr handle, bool opening)
+        {
+            if (handle == IntPtr.Zero)
+                return;
+
+            try
+            {
+                AnimateWindow(handle, opening ? 90 : 70, opening ? (AW_BLEND | AW_ACTIVATE) : (AW_BLEND | AW_HIDE));
+            }
+            catch { }
         }
 
         public static void ApplyForm(Form form)
@@ -2974,34 +3036,6 @@ namespace MihomoTray
             return path;
         }
 
-        static Font CreateFont(float size, FontStyle style)
-        {
-            string[] names = new string[] { "MiSans", "Noto Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", SystemFonts.MessageBoxFont.FontFamily.Name };
-            string familyName = names[names.Length - 1];
-
-            try
-            {
-                using (var installed = new InstalledFontCollection())
-                {
-                    for (int i = 0; i < names.Length; i++)
-                    {
-                        for (int j = 0; j < installed.Families.Length; j++)
-                        {
-                            if (string.Equals(installed.Families[j].Name, names[i], StringComparison.OrdinalIgnoreCase))
-                            {
-                                familyName = names[i];
-                                i = names.Length;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            catch { }
-
-            return new Font(familyName, size, style, GraphicsUnit.Point);
-        }
-
         static Image CreateMenuIcon(string key, bool active)
         {
             var bmp = new Bitmap(18, 18);
@@ -3142,8 +3176,6 @@ namespace MihomoTray
     {
         const int IconLeft = 17;
         const int IconSize = 18;
-        const int TextLeft = 46;
-        const int TextRightPadding = 28;
 
         public TelegramMenuRenderer() : base(new TelegramMenuColorTable()) { }
 
@@ -3151,7 +3183,7 @@ namespace MihomoTray
         {
             Rectangle rect = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
             using (var brush = new SolidBrush(UiStyles.PanelBack))
-            using (var path = UiStyles.RoundedRect(rect, 10))
+            using (var path = UiStyles.RoundedRect(rect, 6))
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 e.Graphics.FillPath(brush, path);
@@ -3170,7 +3202,7 @@ namespace MihomoTray
             Rectangle rect = new Rectangle(4, 1, Math.Max(1, e.Item.Width - 8), Math.Max(1, e.Item.Height - 2));
             Color fill = e.Item.Selected && e.Item.Enabled ? UiStyles.HoverBack : UiStyles.PanelBack;
             using (var brush = new SolidBrush(fill))
-            using (var path = UiStyles.RoundedRect(rect, 7))
+            using (var path = UiStyles.RoundedRect(rect, 3))
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 e.Graphics.FillPath(brush, path);
@@ -3189,22 +3221,8 @@ namespace MihomoTray
 
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
-            if (string.IsNullOrEmpty(e.Text))
-                return;
-
-            e.Graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-
-            Color color = UiStyles.MenuTextColor(e.Item);
-            RectangleF rect = TextRectangle(e.Graphics, e.Item, e.Text, e.TextFont);
-            using (var brush = new SolidBrush(color))
-            using (var format = new StringFormat())
-            {
-                format.Alignment = StringAlignment.Near;
-                format.LineAlignment = StringAlignment.Center;
-                format.Trimming = StringTrimming.EllipsisCharacter;
-                format.FormatFlags = StringFormatFlags.NoWrap;
-                e.Graphics.DrawString(e.Text, e.TextFont, brush, rect, format);
-            }
+            e.TextColor = UiStyles.MenuTextColor(e.Item);
+            base.OnRenderItemText(e);
         }
 
         protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e)
@@ -3249,7 +3267,7 @@ namespace MihomoTray
         {
             Rectangle rect = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
             using (var pen = new Pen(UiStyles.Border))
-            using (var path = UiStyles.RoundedRect(rect, 10))
+            using (var path = UiStyles.RoundedRect(rect, 6))
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 e.Graphics.DrawPath(pen, path);
@@ -3260,15 +3278,6 @@ namespace MihomoTray
         {
             int top = (item.Height - IconSize) / 2;
             return new Rectangle(IconLeft, top, IconSize, IconSize);
-        }
-
-        static RectangleF TextRectangle(Graphics g, ToolStripItem item, string text, Font font)
-        {
-            int availableWidth = Math.Max(20, item.Width - TextLeft - TextRightPadding);
-            SizeF measured = g.MeasureString(text, font, availableWidth, StringFormat.GenericTypographic);
-            float height = Math.Min(item.Height, Math.Max(font.GetHeight(g), measured.Height));
-            float top = (item.Height - height) / 2F + 0.5F;
-            return new RectangleF(TextLeft, top, availableWidth, height);
         }
     }
 
