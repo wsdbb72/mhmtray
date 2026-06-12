@@ -166,6 +166,8 @@ namespace MihomoTray
         const int AssetDownloadTimeoutMilliseconds = 180000;
         const int AssetRetryDelayMilliseconds = 800;
         const int AssetProxyProbeTimeoutMilliseconds = 800;
+        const int SubscriptionDirectTimeoutMilliseconds = 8000;
+        const int SubscriptionProxyTimeoutMilliseconds = 30000;
 
         static readonly Regex TunEnableRegex = new Regex(
             @"(?m)(^tun:\s*\r?\n(?:[ \t]+[^\r\n]*(?:\r?\n))*?[ \t]+enable:\s*)(true|false)",
@@ -3247,18 +3249,60 @@ namespace MihomoTray
 
         string DownloadUrl(string url)
         {
+            var errors = new StringBuilder();
+
+            try
+            {
+                return DownloadUrlWithRoute(url, null, SubscriptionDirectTimeoutMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                errors.Append("直连: ").Append(ex.Message).Append("\r\n");
+            }
+
+            var proxyRoutes = new List<UpdateRequestRoute>();
+            AddSystemProxyRoutes(proxyRoutes);
+            if (proxyRoutes.Count == 0)
+                throw new Exception("直连失败，且未检测到系统代理配置。\r\n" + errors.ToString().TrimEnd());
+
+            foreach (UpdateRequestRoute route in proxyRoutes)
+            {
+                try
+                {
+                    return DownloadUrlWithRoute(url, route.Proxy, SubscriptionProxyTimeoutMilliseconds);
+                }
+                catch (Exception ex)
+                {
+                    errors.Append(route.Name).Append(": ").Append(ex.Message).Append("\r\n");
+                }
+            }
+
+            throw new Exception("直连和系统代理均更新失败。\r\n" + errors.ToString().TrimEnd());
+        }
+
+        string DownloadUrlWithRoute(string url, IWebProxy proxy, int timeoutMilliseconds)
+        {
             var request = (HttpWebRequest)WebRequest.Create(url);
-            request.Timeout = 30000;
+            request.Proxy = proxy;
+            request.Timeout = timeoutMilliseconds;
+            request.ReadWriteTimeout = timeoutMilliseconds;
             request.UserAgent = "clash-verge/1.0";
             request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
             request.AllowAutoRedirect = true;
             request.MaximumAutomaticRedirections = 5;
 
-            using (var response = (HttpWebResponse)request.GetResponse())
-            using (var stream = response.GetResponseStream())
-            using (var reader = new StreamReader(stream, Encoding.UTF8))
+            try
             {
-                return reader.ReadToEnd();
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var stream = response.GetResponseStream())
+                using (var reader = new StreamReader(stream, Encoding.UTF8))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+            catch (WebException ex)
+            {
+                throw new Exception(DescribeUpdateWebException(ex));
             }
         }
 
