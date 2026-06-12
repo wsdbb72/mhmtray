@@ -133,6 +133,13 @@ namespace MihomoTray
             public string ProcessName;
         }
 
+        class DefaultRouteCandidate
+        {
+            public string Name;
+            public NetworkInterfaceType NetworkType;
+            public int Metric;
+        }
+
         // ──── P/Invoke for system proxy refresh ────
 
         [DllImport("wininet.dll", SetLastError = true)]
@@ -140,6 +147,9 @@ namespace MihomoTray
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool DestroyIcon(IntPtr hIcon);
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        static extern int GetBestInterface(uint dwDestAddr, out uint pdwBestIfIndex);
 
         const int INTERNET_OPTION_SETTINGS_CHANGED = 39;
         const int INTERNET_OPTION_REFRESH = 37;
@@ -149,6 +159,9 @@ namespace MihomoTray
             @"(?m)(^tun:\s*\r?\n(?:[ \t]+[^\r\n]*(?:\r?\n))*?[ \t]+enable:\s*)(true|false)",
             RegexOptions.IgnoreCase);
         static readonly Regex HttpPortRegex = new Regex(@"(?m)^port:\s*(\d+)");
+        static readonly Regex TunBlockRegex = new Regex(
+            @"(?ms)^tun:\s*\r?\n(?<body>(?:^[ \t]+[^\r\n]*(?:\r?\n|$))*)",
+            RegexOptions.IgnoreCase);
 
         // ──── Constructor ────
 
@@ -545,16 +558,48 @@ namespace MihomoTray
         {
             List<TunConflictInfo> conflicts = FindTunConflictPrograms();
             if (conflicts.Count == 0)
-                return true;
+                return PrepareTunConfigForCurrentNetwork();
 
             TunConflictAction action = ShowTunConflictDialog(conflicts);
             if (action == TunConflictAction.Cancel)
                 return false;
 
             if (action == TunConflictAction.Continue)
-                return true;
+                return PrepareTunConfigForCurrentNetwork();
 
-            return StopTunConflictProcesses(conflicts);
+            return StopTunConflictProcesses(conflicts) && PrepareTunConfigForCurrentNetwork();
+        }
+
+        bool PrepareTunConfigForCurrentNetwork()
+        {
+            try
+            {
+                string interfaceName = GetDefaultPhysicalInterfaceName();
+                if (string.IsNullOrEmpty(interfaceName))
+                {
+                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                        "未找到可用的物理默认网络接口，TUN 模式暂不开启。",
+                        ToolTipIcon.Warning);
+                    return false;
+                }
+
+                if (!PatchTunConfigForInterface(interfaceName))
+                {
+                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                        "无法写入 TUN 网络接口配置。",
+                        ToolTipIcon.Warning);
+                    return false;
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "准备 TUN 配置失败: " + ex.Message,
+                    ToolTipIcon.Warning);
+                return false;
+            }
         }
 
         TunConflictAction ShowTunConflictDialog(List<TunConflictInfo> conflicts)
@@ -706,6 +751,136 @@ namespace MihomoTray
 
             System.Threading.Thread.Sleep(500);
             return true;
+        }
+
+        string GetDefaultPhysicalInterfaceName()
+        {
+            try
+            {
+                string bestInterface = GetBestPhysicalInterfaceName();
+                if (!string.IsNullOrEmpty(bestInterface))
+                    return bestInterface;
+
+                var candidates = new List<DefaultRouteCandidate>();
+                NetworkInterface[] adapters = NetworkInterface.GetAllNetworkInterfaces();
+
+                foreach (NetworkInterface adapter in adapters)
+                {
+                    try
+                    {
+                        if (adapter.OperationalStatus != OperationalStatus.Up)
+                            continue;
+                        if (IsVirtualOrConflictingAdapter(adapter))
+                            continue;
+
+                        IPInterfaceProperties props = adapter.GetIPProperties();
+                        if (props == null || props.GatewayAddresses == null)
+                            continue;
+
+                        bool hasIpv4Gateway = false;
+                        foreach (GatewayIPAddressInformation gateway in props.GatewayAddresses)
+                        {
+                            if (gateway != null &&
+                                gateway.Address != null &&
+                                gateway.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+                                !gateway.Address.Equals(IPAddress.Any))
+                            {
+                                hasIpv4Gateway = true;
+                                break;
+                            }
+                        }
+
+                        if (!hasIpv4Gateway)
+                            continue;
+
+                        IPInterfaceProperties ipProps = adapter.GetIPProperties();
+                        IPv4InterfaceProperties ipv4 = ipProps == null ? null : ipProps.GetIPv4Properties();
+                        candidates.Add(new DefaultRouteCandidate
+                        {
+                            Name = adapter.Name,
+                            NetworkType = adapter.NetworkInterfaceType,
+                            Metric = ipv4 == null ? 9999 : ipv4.Index
+                        });
+                    }
+                    catch { }
+                }
+
+                candidates.Sort(delegate(DefaultRouteCandidate left, DefaultRouteCandidate right)
+                {
+                    int scoreCompare = GetAdapterPreferenceScore(left).CompareTo(GetAdapterPreferenceScore(right));
+                    if (scoreCompare != 0)
+                        return scoreCompare;
+                    return left.Metric.CompareTo(right.Metric);
+                });
+
+                if (candidates.Count > 0)
+                    return candidates[0].Name;
+            }
+            catch { }
+
+            return "";
+        }
+
+        string GetBestPhysicalInterfaceName()
+        {
+            try
+            {
+                uint bestIndex;
+                uint cloudflareDns = BitConverter.ToUInt32(IPAddress.Parse("1.1.1.1").GetAddressBytes(), 0);
+                if (GetBestInterface(cloudflareDns, out bestIndex) != 0)
+                    return "";
+
+                NetworkInterface[] adapters = NetworkInterface.GetAllNetworkInterfaces();
+                foreach (NetworkInterface adapter in adapters)
+                {
+                    try
+                    {
+                        IPInterfaceProperties props = adapter.GetIPProperties();
+                        IPv4InterfaceProperties ipv4 = props == null ? null : props.GetIPv4Properties();
+                        if (ipv4 == null || (uint)ipv4.Index != bestIndex)
+                            continue;
+
+                        if (adapter.OperationalStatus == OperationalStatus.Up && !IsVirtualOrConflictingAdapter(adapter))
+                            return adapter.Name;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            return "";
+        }
+
+        int GetAdapterPreferenceScore(DefaultRouteCandidate candidate)
+        {
+            if (candidate.NetworkType == NetworkInterfaceType.Wireless80211)
+                return 0;
+            if (candidate.NetworkType == NetworkInterfaceType.Ethernet ||
+                candidate.NetworkType == NetworkInterfaceType.GigabitEthernet ||
+                candidate.NetworkType == NetworkInterfaceType.FastEthernetFx ||
+                candidate.NetworkType == NetworkInterfaceType.FastEthernetT)
+                return 1;
+            return 2;
+        }
+
+        bool IsVirtualOrConflictingAdapter(NetworkInterface adapter)
+        {
+            string text = ((adapter.Name ?? "") + " " + (adapter.Description ?? "")).ToLowerInvariant();
+            string[] tokens = new string[]
+            {
+                "zerotier", "tailscale", "wireguard", "openvpn", "tap-windows", "wintun",
+                "hyper-v", "vethernet", "virtual", "vmware", "virtualbox",
+                "qmtap", "accelerator", "booster", "netpas", "uubooster", "neteaseuu",
+                "leigod", "xunyou", "qiyou"
+            };
+
+            foreach (string token in tokens)
+            {
+                if (text.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+
+            return false;
         }
 
         List<TunConflictInfo> FindTunConflictPrograms()
@@ -1884,6 +2059,17 @@ namespace MihomoTray
                 if (string.IsNullOrEmpty(configPath)) return false;
                 string content = ReadActiveConfigContent();
                 if (string.IsNullOrEmpty(content)) return false;
+                if (enable)
+                {
+                    string interfaceName = GetDefaultPhysicalInterfaceName();
+                    if (!string.IsNullOrEmpty(interfaceName))
+                    {
+                        content = SetTopLevelYamlScalar(content, "interface-name", interfaceName);
+                        content = SetTunYamlScalar(content, "auto-detect-interface", "false");
+                        content = SetTunYamlScalar(content, "auto-route", "true");
+                        content = SetTunYamlScalar(content, "auto-redirect", "true");
+                    }
+                }
                 string newContent = TunEnableRegex.Replace(content,
                     "$1" + (enable ? "true" : "false"),
                     1);
@@ -1900,6 +2086,76 @@ namespace MihomoTray
         }
 
         // ──── Subscription ────
+
+        bool PatchTunConfigForInterface(string interfaceName)
+        {
+            if (string.IsNullOrWhiteSpace(interfaceName))
+                return false;
+
+            string configPath = GetActiveConfigPath();
+            if (string.IsNullOrEmpty(configPath))
+                return false;
+
+            string content = ReadActiveConfigContent();
+            if (string.IsNullOrEmpty(content))
+                return false;
+
+            string patched = SetTopLevelYamlScalar(content, "interface-name", interfaceName);
+            patched = SetTunYamlScalar(patched, "auto-detect-interface", "false");
+            patched = SetTunYamlScalar(patched, "auto-route", "true");
+            patched = SetTunYamlScalar(patched, "auto-redirect", "true");
+
+            if (patched != content)
+            {
+                WriteUtf8FileAtomic(configPath, patched);
+                UpdateActiveConfigCache(configPath, patched);
+            }
+
+            return true;
+        }
+
+        string SetTopLevelYamlScalar(string content, string key, string value)
+        {
+            string line = key + ": " + EscapeYamlScalar(value);
+            Regex regex = new Regex(@"(?m)^" + Regex.Escape(key) + @":\s*.*$", RegexOptions.IgnoreCase);
+            if (regex.IsMatch(content))
+                return regex.Replace(content, line, 1);
+
+            return line + "\r\n" + content;
+        }
+
+        string SetTunYamlScalar(string content, string key, string value)
+        {
+            Match match = TunBlockRegex.Match(content);
+            if (!match.Success)
+                return content;
+
+            string block = match.Value;
+            string line = "  " + key + ": " + value;
+            Regex regex = new Regex(@"(?m)^[ \t]+" + Regex.Escape(key) + @":\s*.*$", RegexOptions.IgnoreCase);
+            string newBlock;
+            if (regex.IsMatch(block))
+            {
+                newBlock = regex.Replace(block, line, 1);
+            }
+            else
+            {
+                int insertIndex = block.Length;
+                if (insertIndex > 0 && block[insertIndex - 1] != '\n')
+                    newBlock = block + "\r\n" + line + "\r\n";
+                else
+                    newBlock = block + line + "\r\n";
+            }
+
+            return content.Substring(0, match.Index) + newBlock + content.Substring(match.Index + match.Length);
+        }
+
+        string EscapeYamlScalar(string value)
+        {
+            if (value == null)
+                return "\"\"";
+            return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+        }
 
         bool DownloadAndMergeSubscription(string url, string name)
         {
