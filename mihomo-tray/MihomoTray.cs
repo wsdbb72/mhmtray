@@ -10,6 +10,7 @@ using System.IO.Compression;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -96,6 +97,7 @@ namespace MihomoTray
         bool _cachedSystemProxyEnabled;
         string _cachedSystemProxyServer;
         DateTime _lastSystemProxyReadUtc;
+        Dictionary<string, AssetVersionInfo> _assetVersions = new Dictionary<string, AssetVersionInfo>(StringComparer.OrdinalIgnoreCase);
 
         bool _isAdmin;
 
@@ -146,6 +148,25 @@ namespace MihomoTray
             public IWebProxy Proxy;
             public string Key;
             public int Attempts;
+        }
+
+        class AssetReleaseInfo
+        {
+            public string TagName;
+            public string AssetName;
+            public string DownloadUrl;
+            public string UpdatedAt;
+            public string Digest;
+            public long Size;
+        }
+
+        class AssetVersionInfo
+        {
+            public string TagName;
+            public string AssetName;
+            public string UpdatedAt;
+            public string Digest;
+            public long Size;
         }
 
         // ──── P/Invoke for system proxy refresh ────
@@ -1856,14 +1877,17 @@ namespace MihomoTray
             new System.Threading.Thread((System.Threading.ThreadStart)delegate
             {
                 bool changedCore = false;
-                bool coreSelected = HasCoreUpdate(options);
+                bool coreSelected = false;
                 bool coreStopped = false;
                 bool wasRunning = false;
+                int skipped = 0;
+                int changed = 0;
                 var errors = new StringBuilder();
                 var apiCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
                 try
                 {
+                    SortAssetUpdateOptions(options);
                     foreach (var opt in options)
                     {
                         try
@@ -1880,13 +1904,24 @@ namespace MihomoTray
                             if (apiJson.Contains("\"message\""))
                                 throw new Exception(ExtractApiError(apiJson));
 
-                            string downloadUrl = FindAssetUrl(apiJson, opt);
-                            if (string.IsNullOrEmpty(downloadUrl))
+                            AssetReleaseInfo releaseInfo = FindAssetReleaseInfo(apiJson, opt);
+                            if (releaseInfo == null || string.IsNullOrEmpty(releaseInfo.DownloadUrl))
                                 throw new Exception("未找到匹配的下载地址");
+
+                            string skipReason;
+                            if (IsAssetAlreadyCurrent(opt, releaseInfo, out skipReason))
+                            {
+                                skipped++;
+                                continue;
+                            }
 
                             Action beforeReplace = null;
                             if (opt.IsCore)
                             {
+                                if (errors.Length > 0)
+                                    throw new Exception("前置组件更新失败，已跳过核心替换以避免停止运行中的核心");
+
+                                coreSelected = true;
                                 beforeReplace = delegate
                                 {
                                     if (coreStopped)
@@ -1918,8 +1953,11 @@ namespace MihomoTray
                                 };
                             }
 
-                            DownloadFile(downloadUrl, opt.IsZip || opt.IsGz, opt.IsGz, opt.TargetPath, beforeReplace);
-                            if (opt.IsCore) changedCore = true;
+                            DownloadFile(releaseInfo.DownloadUrl, opt.IsZip || opt.IsGz, opt.IsGz, opt.TargetPath, beforeReplace);
+                            RecordAssetVersion(opt, releaseInfo);
+                            changed++;
+                            if (opt.IsCore)
+                                changedCore = true;
                         }
                         catch (Exception ex)
                         {
@@ -1934,7 +1972,7 @@ namespace MihomoTray
 
                 Action finish = delegate
                 {
-                    FinishAssetUpdate(coreSelected, coreStopped, wasRunning, changedCore, errors);
+                    FinishAssetUpdate(coreSelected, coreStopped, wasRunning, changedCore, changed, skipped, errors);
                 };
 
                 try
@@ -1952,7 +1990,7 @@ namespace MihomoTray
             { IsBackground = true }.Start();
         }
 
-        void FinishAssetUpdate(bool coreSelected, bool coreStopped, bool wasRunning, bool changedCore, StringBuilder errors)
+        void FinishAssetUpdate(bool coreSelected, bool coreStopped, bool wasRunning, bool changedCore, int changed, int skipped, StringBuilder errors)
         {
             try
             {
@@ -1964,9 +2002,19 @@ namespace MihomoTray
                 if (errors.Length > 0)
                     MessageBox.Show(errors.ToString(), "部分更新失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 else
+                {
+                    string message;
+                    if (changed == 0 && skipped > 0)
+                        message = "组件已是最新版";
+                    else if (skipped > 0)
+                        message = (changedCore ? "核心和组件更新完成" : "组件更新完成") + "，已跳过 " + skipped + " 项最新版";
+                    else
+                        message = changedCore ? "核心和组件更新完成" : "组件更新完成";
+
                     _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                        changedCore ? "核心和组件更新完成" : "组件更新完成",
+                        message,
                         ToolTipIcon.Info);
+                }
 
                 RefreshUI();
             }
@@ -1994,14 +2042,212 @@ namespace MihomoTray
             return "API error (unknown)";
         }
 
-        bool HasCoreUpdate(List<AssetUpdateOption> options)
+        void SortAssetUpdateOptions(List<AssetUpdateOption> options)
         {
-            foreach (var option in options)
+            options.Sort(delegate(AssetUpdateOption left, AssetUpdateOption right)
             {
-                if (option.IsCore)
+                if (left.IsCore == right.IsCore)
+                    return 0;
+                return left.IsCore ? 1 : -1;
+            });
+        }
+
+        bool IsAssetAlreadyCurrent(AssetUpdateOption opt, AssetReleaseInfo releaseInfo, out string reason)
+        {
+            reason = "";
+            if (opt == null || releaseInfo == null || string.IsNullOrEmpty(opt.TargetPath) || !File.Exists(opt.TargetPath))
+                return false;
+
+            if (opt.IsCore)
+            {
+                string localVersion = ReadLocalMihomoVersion();
+                string latestVersion = NormalizeMihomoVersion(releaseInfo.TagName);
+                if (!string.IsNullOrEmpty(localVersion) &&
+                    !string.IsNullOrEmpty(latestVersion) &&
+                    string.Equals(localVersion, latestVersion, StringComparison.OrdinalIgnoreCase))
+                {
+                    reason = "本地内核已是 " + latestVersion;
                     return true;
+                }
             }
+
+            string expectedSha256 = ExtractSha256Digest(releaseInfo.Digest);
+            if (!string.IsNullOrEmpty(expectedSha256) && !opt.IsZip && !opt.IsGz)
+            {
+                try
+                {
+                    string localSha256 = ComputeFileSha256(opt.TargetPath);
+                    if (string.Equals(localSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
+                    {
+                        reason = "本地文件哈希一致";
+                        return true;
+                    }
+                }
+                catch { }
+            }
+
+            AssetVersionInfo recorded;
+            if (TryGetRecordedAssetVersion(opt, out recorded) && AssetVersionMatches(recorded, releaseInfo))
+            {
+                if (opt.IsZip || opt.IsGz)
+                {
+                    reason = "本地记录已是最新版";
+                    return true;
+                }
+
+                try
+                {
+                    long localLength = new FileInfo(opt.TargetPath).Length;
+                    if (releaseInfo.Size <= 0 || localLength == releaseInfo.Size)
+                    {
+                        reason = "本地记录已是最新版";
+                        return true;
+                    }
+                }
+                catch { }
+            }
+
             return false;
+        }
+
+        bool TryGetRecordedAssetVersion(AssetUpdateOption opt, out AssetVersionInfo info)
+        {
+            info = null;
+            if (_assetVersions == null)
+                return false;
+
+            return _assetVersions.TryGetValue(GetAssetVersionKey(opt), out info);
+        }
+
+        bool AssetVersionMatches(AssetVersionInfo recorded, AssetReleaseInfo releaseInfo)
+        {
+            if (recorded == null || releaseInfo == null)
+                return false;
+
+            return string.Equals(recorded.TagName ?? "", releaseInfo.TagName ?? "", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(recorded.AssetName ?? "", releaseInfo.AssetName ?? "", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(recorded.UpdatedAt ?? "", releaseInfo.UpdatedAt ?? "", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(recorded.Digest ?? "", releaseInfo.Digest ?? "", StringComparison.OrdinalIgnoreCase) &&
+                (recorded.Size <= 0 || releaseInfo.Size <= 0 || recorded.Size == releaseInfo.Size);
+        }
+
+        void RecordAssetVersion(AssetUpdateOption opt, AssetReleaseInfo releaseInfo)
+        {
+            if (opt == null || releaseInfo == null)
+                return;
+
+            if (_assetVersions == null)
+                _assetVersions = new Dictionary<string, AssetVersionInfo>(StringComparer.OrdinalIgnoreCase);
+
+            _assetVersions[GetAssetVersionKey(opt)] = new AssetVersionInfo
+            {
+                TagName = releaseInfo.TagName ?? "",
+                AssetName = releaseInfo.AssetName ?? opt.AssetName ?? "",
+                UpdatedAt = releaseInfo.UpdatedAt ?? "",
+                Digest = releaseInfo.Digest ?? "",
+                Size = releaseInfo.Size
+            };
+
+            try { SaveTrayConfig(); } catch { }
+        }
+
+        string GetAssetVersionKey(AssetUpdateOption opt)
+        {
+            if (opt == null)
+                return "";
+
+            if (!string.IsNullOrEmpty(opt.AssetName))
+                return opt.AssetName.ToLowerInvariant();
+
+            if (!string.IsNullOrEmpty(opt.DisplayName))
+                return opt.DisplayName.ToLowerInvariant();
+
+            return NormalizeRelativePath(opt.TargetPath).ToLowerInvariant();
+        }
+
+        string ReadLocalMihomoVersion()
+        {
+            if (!File.Exists(_mihomoExePath))
+                return "";
+
+            Process process = null;
+            try
+            {
+                var psi = new ProcessStartInfo();
+                psi.FileName = _mihomoExePath;
+                psi.Arguments = "-v";
+                psi.WorkingDirectory = _basePath;
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+
+                process = Process.Start(psi);
+                if (process == null)
+                    return "";
+
+                if (!process.WaitForExit(3000))
+                {
+                    try { process.Kill(); } catch { }
+                    return "";
+                }
+
+                string output = "";
+                try { output += process.StandardOutput.ReadToEnd(); } catch { }
+                try { output += "\n" + process.StandardError.ReadToEnd(); } catch { }
+                return NormalizeMihomoVersion(output);
+            }
+            catch
+            {
+                return "";
+            }
+            finally
+            {
+                if (process != null)
+                {
+                    try { process.Dispose(); } catch { }
+                }
+            }
+        }
+
+        string NormalizeMihomoVersion(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return "";
+
+            Match match = Regex.Match(text, @"v?\d+(?:\.\d+)+", RegexOptions.IgnoreCase);
+            if (!match.Success)
+                return text.Trim();
+
+            string version = match.Value.Trim();
+            if (!version.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+                version = "v" + version;
+            return version.ToLowerInvariant();
+        }
+
+        string ExtractSha256Digest(string digest)
+        {
+            if (string.IsNullOrWhiteSpace(digest))
+                return "";
+
+            Match match = Regex.Match(digest, @"sha256:([0-9a-fA-F]{64})");
+            if (!match.Success)
+                return "";
+
+            return match.Groups[1].Value.ToLowerInvariant();
+        }
+
+        string ComputeFileSha256(string path)
+        {
+            using (var sha = SHA256.Create())
+            using (var stream = File.OpenRead(path))
+            {
+                byte[] hash = sha.ComputeHash(stream);
+                var sb = new StringBuilder(hash.Length * 2);
+                foreach (byte b in hash)
+                    sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
         }
 
         void OnSubscriptionManager(object sender, EventArgs e)
@@ -2666,6 +2912,8 @@ namespace MihomoTray
                     _pendingEnableTunAfterAdmin = pendingTunMatch.Groups[1].Value == "true";
                 }
 
+                LoadAssetVersions(json);
+
                 var profilesMatch = Regex.Matches(json,
                     @"""profiles""\s*:\s*\[(.*?)\]",
                     RegexOptions.Singleline);
@@ -2740,6 +2988,8 @@ namespace MihomoTray
             sb.Append("  \"lastSystemProxyEnabled\": ").Append(_systemProxyDesired ? "true" : "false").Append(",\r\n");
             sb.Append("  \"systemProxyGuardEnabled\": ").Append(_systemProxyGuardEnabled ? "true" : "false").Append(",\r\n");
             sb.Append("  \"pendingEnableTunAfterAdmin\": ").Append(_pendingEnableTunAfterAdmin ? "true" : "false").Append(",\r\n");
+            AppendAssetVersionsJson(sb);
+            sb.Append(",\r\n");
             sb.Append("  \"subscriptions\": [\r\n");
             for (int i = 0; i < subs.Count; i++)
             {
@@ -2754,6 +3004,80 @@ namespace MihomoTray
             sb.Append("  ]\r\n");
             sb.Append("}\r\n");
             WriteUtf8FileAtomic(_trayConfigPath, sb.ToString());
+        }
+
+        void LoadAssetVersions(string json)
+        {
+            var versions = new Dictionary<string, AssetVersionInfo>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                var assetVersionsMatch = Regex.Match(json,
+                    @"""assetVersions""\s*:\s*\{(?<body>.*?)\}\s*,\s*""subscriptions""",
+                    RegexOptions.Singleline);
+                if (!assetVersionsMatch.Success)
+                    assetVersionsMatch = Regex.Match(json,
+                        @"""assetVersions""\s*:\s*\{(?<body>.*?)\}\s*\}",
+                        RegexOptions.Singleline);
+
+                if (assetVersionsMatch.Success)
+                {
+                    string body = assetVersionsMatch.Groups["body"].Value;
+                    var entries = Regex.Matches(body,
+                        @"""(?<key>[^""]+)""\s*:\s*\{(?<value>.*?)\}",
+                        RegexOptions.Singleline);
+
+                    foreach (Match entry in entries)
+                    {
+                        string key = Regex.Unescape(entry.Groups["key"].Value);
+                        string value = entry.Groups["value"].Value;
+                        long size = 0;
+                        long.TryParse(ExtractJsonNumber(value, "size"), out size);
+
+                        versions[key] = new AssetVersionInfo
+                        {
+                            TagName = ExtractJsonString(value, "tagName"),
+                            AssetName = ExtractJsonString(value, "assetName"),
+                            UpdatedAt = ExtractJsonString(value, "updatedAt"),
+                            Digest = ExtractJsonString(value, "digest"),
+                            Size = size
+                        };
+                    }
+                }
+            }
+            catch { }
+
+            _assetVersions = versions;
+        }
+
+        void AppendAssetVersionsJson(StringBuilder sb)
+        {
+            sb.Append("  \"assetVersions\": {\r\n");
+            var keys = new List<string>();
+            if (_assetVersions != null)
+            {
+                foreach (KeyValuePair<string, AssetVersionInfo> pair in _assetVersions)
+                {
+                    if (pair.Value != null)
+                        keys.Add(pair.Key);
+                }
+
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    string key = keys[i];
+                    AssetVersionInfo info = _assetVersions[key];
+                    sb.Append("    \"").Append(EscapeJson(key)).Append("\": {\r\n");
+                    sb.Append("      \"tagName\": \"").Append(EscapeJson(info.TagName)).Append("\",\r\n");
+                    sb.Append("      \"assetName\": \"").Append(EscapeJson(info.AssetName)).Append("\",\r\n");
+                    sb.Append("      \"updatedAt\": \"").Append(EscapeJson(info.UpdatedAt)).Append("\",\r\n");
+                    sb.Append("      \"digest\": \"").Append(EscapeJson(info.Digest)).Append("\",\r\n");
+                    sb.Append("      \"size\": ").Append(info.Size < 0 ? 0 : info.Size).Append("\r\n");
+                    sb.Append("    }");
+                    if (i < keys.Count - 1)
+                        sb.Append(",");
+                    sb.Append("\r\n");
+                }
+            }
+            sb.Append("  }");
         }
 
         void ResolveActiveConfig()
@@ -2843,36 +3167,117 @@ namespace MihomoTray
 
         string FindAssetUrl(string apiJson, AssetUpdateOption opt)
         {
+            AssetReleaseInfo info = FindAssetReleaseInfo(apiJson, opt);
+            if (info == null)
+                throw new Exception("未在发布页中找到匹配资源: " + opt.AssetName);
+            return info.DownloadUrl;
+        }
+
+        AssetReleaseInfo FindAssetReleaseInfo(string apiJson, AssetUpdateOption opt)
+        {
             if (string.IsNullOrEmpty(apiJson))
                 throw new Exception("GitHub API 返回为空");
 
-            var matches = Regex.Matches(apiJson,
-                @"""browser_download_url""\s*:\s*""([^""]+)""");
+            string tagName = ExtractJsonString(apiJson, "tag_name");
+            var matches = Regex.Matches(apiJson, @"""browser_download_url""\s*:\s*""([^""]+)""");
+            AssetReleaseInfo fallback = null;
 
             foreach (Match m in matches)
             {
-                string candidate = m.Groups[1].Value;
-                string fileName = Path.GetFileName(candidate).ToLowerInvariant();
+                AssetReleaseInfo info = ParseAssetReleaseInfo(apiJson, m, tagName);
+                string fileName = (info.AssetName ?? Path.GetFileName(info.DownloadUrl)).ToLowerInvariant();
 
                 if (opt.MatchPattern != null)
                 {
                     if (Regex.IsMatch(fileName, opt.MatchPattern, RegexOptions.IgnoreCase))
-                        return candidate;
+                        return info;
                 }
                 else if (fileName == opt.AssetName.ToLowerInvariant())
                 {
-                    return candidate;
+                    return info;
                 }
+
+                if (fallback == null && info.DownloadUrl.ToLowerInvariant().Contains(opt.AssetName.ToLowerInvariant()))
+                    fallback = info;
             }
 
-            foreach (Match m in matches)
-            {
-                string candidate = m.Groups[1].Value;
-                if (candidate.ToLowerInvariant().Contains(opt.AssetName.ToLowerInvariant()))
-                    return candidate;
-            }
+            if (fallback != null)
+                return fallback;
 
             throw new Exception("未在发布页中找到匹配资源: " + opt.AssetName);
+        }
+
+        AssetReleaseInfo ParseAssetReleaseInfo(string apiJson, Match downloadMatch, string tagName)
+        {
+            string downloadUrl = Regex.Unescape(downloadMatch.Groups[1].Value);
+            int windowStart = Math.Max(0, downloadMatch.Index - 12000);
+            string beforeDownloadUrl = apiJson.Substring(windowStart, downloadMatch.Index - windowStart);
+
+            long size = 0;
+            string sizeText = ExtractLastJsonNumber(beforeDownloadUrl, "size");
+            long.TryParse(sizeText, out size);
+
+            string name = ExtractLastJsonString(beforeDownloadUrl, "name");
+            if (string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(downloadUrl))
+                name = Path.GetFileName(downloadUrl);
+
+            return new AssetReleaseInfo
+            {
+                TagName = tagName ?? "",
+                AssetName = name ?? "",
+                DownloadUrl = downloadUrl ?? "",
+                UpdatedAt = ExtractLastJsonString(beforeDownloadUrl, "updated_at"),
+                Digest = ExtractLastJsonString(beforeDownloadUrl, "digest"),
+                Size = size
+            };
+        }
+
+        string ExtractJsonString(string json, string key)
+        {
+            if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key))
+                return "";
+
+            Match match = Regex.Match(json, @"""" + Regex.Escape(key) + @"""\s*:\s*""([^""]*)""");
+            if (!match.Success)
+                return "";
+
+            return Regex.Unescape(match.Groups[1].Value);
+        }
+
+        string ExtractLastJsonString(string json, string key)
+        {
+            if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key))
+                return "";
+
+            var matches = Regex.Matches(json, @"""" + Regex.Escape(key) + @"""\s*:\s*""([^""]*)""");
+            if (matches.Count == 0)
+                return "";
+
+            return Regex.Unescape(matches[matches.Count - 1].Groups[1].Value);
+        }
+
+        string ExtractJsonNumber(string json, string key)
+        {
+            if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key))
+                return "";
+
+            Match match = Regex.Match(json, @"""" + Regex.Escape(key) + @"""\s*:\s*(\d+)");
+            if (!match.Success)
+                return "";
+
+            return match.Groups[1].Value;
+        }
+
+        string ExtractLastJsonNumber(string json, string key)
+        {
+            if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key))
+                return "";
+
+            var matches = Regex.Matches(json, @"""" + Regex.Escape(key) + @"""\s*:\s*(\d+)");
+            if (matches.Count == 0)
+                return "";
+
+            return matches[matches.Count - 1].Groups[1].Value;
         }
 
         void DownloadFile(string url, bool compressed, bool isGz, string targetPath)
@@ -3051,7 +3456,7 @@ namespace MihomoTray
                 }
             }
 
-            throw new Exception("下载文件失败，已尝试系统代理、本程序代理和直连。\r\n" + errors.ToString().TrimEnd());
+            throw new Exception("下载文件失败，已尝试可用代理和直连。\r\n" + errors.ToString().TrimEnd());
         }
 
         void DownloadUpdateFileOnce(string url, string tempFile, IWebProxy proxy)
@@ -3118,7 +3523,7 @@ namespace MihomoTray
                 }
             }
 
-            throw new Exception("下载超时或网络不可达。已尝试本地代理和直连。\r\n" + errors.ToString().TrimEnd());
+            throw new Exception("下载超时或网络不可达。已尝试可用代理和直连。\r\n" + errors.ToString().TrimEnd());
         }
 
         HttpWebRequest CreateUpdateRequest(string url, bool json, IWebProxy proxy)
@@ -3170,7 +3575,7 @@ namespace MihomoTray
                     2);
             }
 
-            if (routes.Count == routeCountBefore && IsWindowsProxyConfigured(enabled, proxyServer))
+            if (routes.Count == routeCountBefore && HasWindowsAutoProxyConfiguration())
             {
                 try
                 {
@@ -3261,7 +3666,28 @@ namespace MihomoTray
         void AddSystemProxyEndpoint(List<string> endpoints, string endpoint)
         {
             string normalized = NormalizeProxyEndpoint(endpoint, false, false);
+            if (IsUnavailableLocalProxyEndpoint(normalized))
+                return;
+
             AddNormalizedUpdateProxyEndpoint(endpoints, normalized);
+        }
+
+        bool IsUnavailableLocalProxyEndpoint(string normalized)
+        {
+            string host;
+            string portText;
+            if (!TrySplitHostPort(normalized, out host, out portText))
+                return false;
+
+            host = host.Trim().Trim('[', ']');
+            if (!IsLocalProxyHost(host))
+                return false;
+
+            int port;
+            if (!int.TryParse(portText, out port))
+                return false;
+
+            return !IsLocalPortListening(host, port);
         }
 
         void AddLocalUpdateProxyEndpoint(List<string> endpoints, string endpoint)
@@ -3285,11 +3711,8 @@ namespace MihomoTray
             endpoints.Add(normalized);
         }
 
-        bool IsWindowsProxyConfigured(bool enabled, string proxyServer)
+        bool HasWindowsAutoProxyConfiguration()
         {
-            if (enabled && !string.IsNullOrWhiteSpace(proxyServer))
-                return true;
-
             try
             {
                 using (var key = Registry.CurrentUser.OpenSubKey(
