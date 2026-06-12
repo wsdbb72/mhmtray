@@ -140,6 +140,14 @@ namespace MihomoTray
             public int Metric;
         }
 
+        class UpdateRequestRoute
+        {
+            public string Name;
+            public IWebProxy Proxy;
+            public string Key;
+            public int Attempts;
+        }
+
         // ──── P/Invoke for system proxy refresh ────
 
         [DllImport("wininet.dll", SetLastError = true)]
@@ -154,11 +162,16 @@ namespace MihomoTray
         const int INTERNET_OPTION_SETTINGS_CHANGED = 39;
         const int INTERNET_OPTION_REFRESH = 37;
         const int SystemProxyCacheMilliseconds = 1500;
+        const int AssetApiTimeoutMilliseconds = 45000;
+        const int AssetDownloadTimeoutMilliseconds = 180000;
+        const int AssetRetryDelayMilliseconds = 800;
+        const int AssetProxyProbeTimeoutMilliseconds = 800;
 
         static readonly Regex TunEnableRegex = new Regex(
             @"(?m)(^tun:\s*\r?\n(?:[ \t]+[^\r\n]*(?:\r?\n))*?[ \t]+enable:\s*)(true|false)",
             RegexOptions.IgnoreCase);
         static readonly Regex HttpPortRegex = new Regex(@"(?m)^port:\s*(\d+)");
+        static readonly Regex MixedPortRegex = new Regex(@"(?m)^mixed-port:\s*(\d+)");
         static readonly Regex TunBlockRegex = new Regex(
             @"(?ms)^tun:\s*\r?\n(?<body>(?:^[ \t]+[^\r\n]*(?:\r?\n|$))*)",
             RegexOptions.IgnoreCase);
@@ -1647,6 +1660,7 @@ namespace MihomoTray
                 bool coreStopped = false;
                 bool wasRunning = false;
                 var errors = new StringBuilder();
+                var apiCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
                 try
                 {
@@ -1654,7 +1668,12 @@ namespace MihomoTray
                     {
                         try
                         {
-                            string apiJson = DownloadString(opt.ApiUrl);
+                            string apiJson;
+                            if (!apiCache.TryGetValue(opt.ApiUrl, out apiJson))
+                            {
+                                apiJson = DownloadString(opt.ApiUrl);
+                                apiCache[opt.ApiUrl] = apiJson;
+                            }
                             if (string.IsNullOrEmpty(apiJson))
                                 throw new Exception("API 返回空");
 
@@ -2662,20 +2681,10 @@ namespace MihomoTray
 
             try
             {
-                var request = (HttpWebRequest)WebRequest.Create(url);
-                request.Proxy = null;
-                request.Timeout = 60000;
-                request.ReadWriteTimeout = 60000;
-                request.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
-                request.AllowAutoRedirect = true;
-                request.MaximumAutomaticRedirections = 3;
-                request.KeepAlive = false;
-
-                using (var response = (HttpWebResponse)request.GetResponse())
-                using (var stream = response.GetResponseStream())
+                using (var stream = OpenUpdateResponseStream(url, false))
                 using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
-                    byte[] buf = new byte[8192];
+                    byte[] buf = new byte[64 * 1024];
                     int read;
                     while ((read = stream.Read(buf, 0, buf.Length)) > 0)
                         fs.Write(buf, 0, read);
@@ -2790,38 +2799,421 @@ namespace MihomoTray
 
         string DownloadString(string url)
         {
+            using (var stream = OpenUpdateResponseStream(url, true))
+            using (var reader = new StreamReader(stream, Encoding.UTF8))
+            {
+                return reader.ReadToEnd();
+            }
+        }
+
+        Stream OpenUpdateResponseStream(string url, bool json)
+        {
+            var errors = new StringBuilder();
+            List<UpdateRequestRoute> routes = BuildUpdateRequestRoutes();
+
+            foreach (UpdateRequestRoute route in routes)
+            {
+                for (int attempt = 1; attempt <= route.Attempts; attempt++)
+                {
+                    try
+                    {
+                        HttpWebRequest request = CreateUpdateRequest(url, json, route.Proxy);
+                        var response = (HttpWebResponse)request.GetResponse();
+                        Stream responseStream = response.GetResponseStream();
+                        if (responseStream == null)
+                        {
+                            response.Close();
+                            throw new IOException("响应流为空");
+                        }
+
+                        return new WebResponseStream(response, responseStream);
+                    }
+                    catch (WebException ex)
+                    {
+                        string message = DescribeUpdateWebException(ex);
+                        errors.Append(route.Name).Append(" 第 ").Append(attempt).Append(" 次: ")
+                            .Append(message).Append("\r\n");
+                    }
+                    catch (Exception ex)
+                    {
+                        errors.Append(route.Name).Append(" 第 ").Append(attempt).Append(" 次: ")
+                            .Append(ex.Message).Append("\r\n");
+                    }
+
+                    if (attempt < route.Attempts)
+                        System.Threading.Thread.Sleep(AssetRetryDelayMilliseconds);
+                }
+            }
+
+            throw new Exception("下载超时或网络不可达。已尝试本地代理和直连。\r\n" + errors.ToString().TrimEnd());
+        }
+
+        HttpWebRequest CreateUpdateRequest(string url, bool json, IWebProxy proxy)
+        {
             var request = (HttpWebRequest)WebRequest.Create(url);
-            request.Proxy = null;
-            request.Timeout = 15000;
-            request.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+            request.Proxy = proxy;
+            request.Timeout = json ? AssetApiTimeoutMilliseconds : AssetDownloadTimeoutMilliseconds;
+            request.ReadWriteTimeout = json ? AssetApiTimeoutMilliseconds : AssetDownloadTimeoutMilliseconds;
+            request.UserAgent = "MihomoTray/1.0 (+https://github.com/wsdbb72/mhmtray)";
             request.AllowAutoRedirect = true;
-            request.MaximumAutomaticRedirections = 3;
+            request.MaximumAutomaticRedirections = 5;
             request.ProtocolVersion = HttpVersion.Version11;
             request.KeepAlive = false;
-            request.Accept = "application/vnd.github.v3+json";
             request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+            if (json)
+                request.Accept = "application/vnd.github.v3+json";
+            return request;
+        }
+
+        List<UpdateRequestRoute> BuildUpdateRequestRoutes()
+        {
+            var routes = new List<UpdateRequestRoute>();
+            AddSystemProxyRoutes(routes);
+            AddConfigProxyFallbackRoutes(routes);
+            AddUpdateRequestRoute(routes, "直连", null, "direct", 1);
+
+            return routes;
+        }
+
+        void AddSystemProxyRoutes(List<UpdateRequestRoute> routes)
+        {
+            int routeCountBefore = routes.Count;
+            var endpoints = new List<string>();
+            bool enabled;
+            string proxyServer;
+            if (ReadSystemProxySettings(out enabled, out proxyServer) && enabled)
+                AddSystemProxyEndpoints(endpoints, proxyServer);
+
+            foreach (string endpoint in endpoints)
+            {
+                string normalized = NormalizeProxyEndpoint(endpoint, false, false);
+                if (string.IsNullOrEmpty(normalized))
+                    continue;
+
+                AddUpdateRequestRoute(routes,
+                    "系统代理 " + normalized,
+                    new WebProxy("http://" + normalized, false),
+                    "system:" + normalized.ToLowerInvariant(),
+                    2);
+            }
+
+            if (routes.Count == routeCountBefore && IsWindowsProxyConfigured(enabled, proxyServer))
+            {
+                try
+                {
+                    AddUpdateRequestRoute(routes,
+                        "Windows 系统代理",
+                        WebRequest.GetSystemWebProxy(),
+                        "system-default",
+                        2);
+                }
+                catch { }
+            }
+        }
+
+        void AddConfigProxyFallbackRoutes(List<UpdateRequestRoute> routes)
+        {
+            var endpoints = new List<string>();
+            string content = null;
+            try { content = ReadActiveConfigContent(); } catch { }
+
+            AddLocalUpdateProxyEndpoint(endpoints, "127.0.0.1:" + ReadHttpPort());
+
+            if (!string.IsNullOrEmpty(content))
+            {
+                var mixedMatch = MixedPortRegex.Match(content);
+                if (mixedMatch.Success)
+                {
+                    int mixedPort;
+                    if (int.TryParse(mixedMatch.Groups[1].Value, out mixedPort))
+                        AddLocalUpdateProxyEndpoint(endpoints, "127.0.0.1:" + mixedPort);
+                }
+
+                var httpMatch = HttpPortRegex.Match(content);
+                if (httpMatch.Success)
+                {
+                    int httpPort;
+                    if (int.TryParse(httpMatch.Groups[1].Value, out httpPort))
+                        AddLocalUpdateProxyEndpoint(endpoints, "127.0.0.1:" + httpPort);
+                }
+            }
+
+            foreach (string endpoint in endpoints)
+            {
+                AddUpdateRequestRoute(routes,
+                    "本程序代理 " + endpoint,
+                    new WebProxy("http://" + endpoint, false),
+                    "local:" + endpoint.ToLowerInvariant(),
+                    2);
+            }
+        }
+
+        void AddSystemProxyEndpoints(List<string> endpoints, string proxyServer)
+        {
+            if (string.IsNullOrWhiteSpace(proxyServer))
+                return;
+
+            if (proxyServer.IndexOf('=') < 0)
+            {
+                AddSystemProxyEndpoint(endpoints, proxyServer);
+                return;
+            }
+
+            string[] entries = proxyServer.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string rawEntry in entries)
+            {
+                string entry = rawEntry.Trim();
+                int equalIndex = entry.IndexOf('=');
+                if (equalIndex < 0)
+                    continue;
+
+                string scheme = entry.Substring(0, equalIndex).Trim().ToLowerInvariant();
+                if (scheme == "https")
+                    AddSystemProxyEndpoint(endpoints, entry.Substring(equalIndex + 1));
+            }
+
+            foreach (string rawEntry in entries)
+            {
+                string entry = rawEntry.Trim();
+                int equalIndex = entry.IndexOf('=');
+                if (equalIndex < 0)
+                    continue;
+
+                string scheme = entry.Substring(0, equalIndex).Trim().ToLowerInvariant();
+                if (scheme == "http")
+                    AddSystemProxyEndpoint(endpoints, entry.Substring(equalIndex + 1));
+            }
+        }
+
+        void AddSystemProxyEndpoint(List<string> endpoints, string endpoint)
+        {
+            string normalized = NormalizeProxyEndpoint(endpoint, false, false);
+            AddNormalizedUpdateProxyEndpoint(endpoints, normalized);
+        }
+
+        void AddLocalUpdateProxyEndpoint(List<string> endpoints, string endpoint)
+        {
+            string normalized = NormalizeProxyEndpoint(endpoint, true, true);
+            AddNormalizedUpdateProxyEndpoint(endpoints, normalized);
+        }
+
+        void AddNormalizedUpdateProxyEndpoint(List<string> endpoints, string normalized)
+        {
+            if (string.IsNullOrEmpty(normalized))
+                return;
+
+            string key = normalized.ToLowerInvariant();
+            foreach (string existing in endpoints)
+            {
+                if (string.Equals(existing, key, StringComparison.OrdinalIgnoreCase))
+                    return;
+            }
+
+            endpoints.Add(normalized);
+        }
+
+        bool IsWindowsProxyConfigured(bool enabled, string proxyServer)
+        {
+            if (enabled && !string.IsNullOrWhiteSpace(proxyServer))
+                return true;
 
             try
             {
-                using (var response = (HttpWebResponse)request.GetResponse())
-                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                using (var key = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Internet Settings", false))
                 {
-                    return reader.ReadToEnd();
+                    if (key == null)
+                        return false;
+
+                    var autoConfig = key.GetValue("AutoConfigURL");
+                    if (autoConfig != null && !string.IsNullOrWhiteSpace(Convert.ToString(autoConfig)))
+                        return true;
+
+                    var autoDetect = key.GetValue("AutoDetect");
+                    int autoDetectValue = 0;
+                    if (autoDetect is int)
+                        autoDetectValue = (int)autoDetect;
+                    else if (autoDetect != null)
+                        int.TryParse(Convert.ToString(autoDetect), out autoDetectValue);
+
+                    return autoDetectValue == 1;
                 }
             }
-            catch (WebException we)
+            catch
             {
-                if (we.Response != null)
-                {
-                    using (var stream = we.Response.GetResponseStream())
-                    using (var reader = new StreamReader(stream, Encoding.UTF8))
-                    {
-                        string body = reader.ReadToEnd();
-                        throw new Exception("HTTP error: " + body);
-                    }
-                }
-                throw;
+                return false;
             }
+        }
+
+        void AddUpdateRequestRoute(List<UpdateRequestRoute> routes, string name, IWebProxy proxy, string key, int attempts)
+        {
+            foreach (UpdateRequestRoute route in routes)
+            {
+                if (string.Equals(route.Key, key, StringComparison.OrdinalIgnoreCase))
+                    return;
+            }
+
+            routes.Add(new UpdateRequestRoute
+            {
+                Name = name,
+                Proxy = proxy,
+                Key = key,
+                Attempts = attempts
+            });
+        }
+
+        string NormalizeProxyEndpoint(string endpoint, bool requireLocal, bool probe)
+        {
+            if (string.IsNullOrWhiteSpace(endpoint))
+                return null;
+
+            endpoint = endpoint.Trim().Trim('"');
+
+            int schemeIndex = endpoint.IndexOf("://", StringComparison.Ordinal);
+            if (schemeIndex >= 0)
+                endpoint = endpoint.Substring(schemeIndex + 3);
+
+            int slashIndex = endpoint.IndexOfAny(new char[] { '/', '\\' });
+            if (slashIndex >= 0)
+                endpoint = endpoint.Substring(0, slashIndex);
+
+            int atIndex = endpoint.LastIndexOf('@');
+            if (atIndex >= 0)
+                endpoint = endpoint.Substring(atIndex + 1);
+
+            string host;
+            string portText;
+            if (!TrySplitHostPort(endpoint, out host, out portText))
+                return null;
+
+            int port;
+            if (!int.TryParse(portText, out port) || port <= 0 || port > 65535)
+                return null;
+
+            host = host.Trim().Trim('[', ']');
+            if (string.IsNullOrEmpty(host))
+                return null;
+
+            if (requireLocal && !IsLocalProxyHost(host))
+                return null;
+
+            if (probe && !IsLocalPortListening(host, port))
+                return null;
+
+            host = host.ToLowerInvariant();
+            if (host == "::1" || host.IndexOf(':') >= 0)
+                return "[" + host + "]:" + port;
+
+            return host + ":" + port;
+        }
+
+        bool TrySplitHostPort(string endpoint, out string host, out string portText)
+        {
+            host = null;
+            portText = null;
+
+            if (string.IsNullOrWhiteSpace(endpoint))
+                return false;
+
+            endpoint = endpoint.Trim();
+            if (endpoint.StartsWith("[", StringComparison.Ordinal))
+            {
+                int closeIndex = endpoint.IndexOf(']');
+                if (closeIndex < 0 || endpoint.Length <= closeIndex + 2 || endpoint[closeIndex + 1] != ':')
+                    return false;
+
+                host = endpoint.Substring(1, closeIndex - 1).Trim();
+                portText = endpoint.Substring(closeIndex + 2).Trim();
+                return !string.IsNullOrEmpty(host) && !string.IsNullOrEmpty(portText);
+            }
+
+            int colonIndex = endpoint.LastIndexOf(':');
+            if (colonIndex <= 0 || colonIndex >= endpoint.Length - 1)
+                return false;
+
+            host = endpoint.Substring(0, colonIndex).Trim().Trim('[', ']');
+            portText = endpoint.Substring(colonIndex + 1).Trim();
+            return !string.IsNullOrEmpty(host) && !string.IsNullOrEmpty(portText);
+        }
+
+        bool IsLocalProxyHost(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+                return false;
+
+            host = host.Trim().Trim('[', ']').ToLowerInvariant();
+            return host == "localhost" || host == "127.0.0.1" || host == "::1";
+        }
+
+        bool IsLocalPortListening(string host, int port)
+        {
+            try
+            {
+                using (var client = new System.Net.Sockets.TcpClient())
+                {
+                    string connectHost = host;
+                    if (string.Equals(connectHost, "localhost", StringComparison.OrdinalIgnoreCase))
+                        connectHost = "127.0.0.1";
+
+                    IAsyncResult ar = client.BeginConnect(connectHost, port, null, null);
+                    bool connected = ar.AsyncWaitHandle.WaitOne(AssetProxyProbeTimeoutMilliseconds);
+                    if (!connected)
+                    {
+                        try { client.Close(); } catch { }
+                        return false;
+                    }
+
+                    client.EndConnect(ar);
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        string DescribeUpdateWebException(WebException ex)
+        {
+            if (ex.Response != null)
+            {
+                using (var response = ex.Response)
+                using (var stream = response.GetResponseStream())
+                {
+                    string body = null;
+                    if (stream != null)
+                    {
+                        using (var reader = new StreamReader(stream, Encoding.UTF8))
+                        {
+                            body = reader.ReadToEnd();
+                        }
+                    }
+
+                    var http = response as HttpWebResponse;
+                    if (http != null)
+                    {
+                        string prefix = "HTTP " + (int)http.StatusCode + " " + http.StatusDescription;
+                        if (!string.IsNullOrWhiteSpace(body))
+                            return prefix + ": " + TrimForMessage(body, 240);
+                        return prefix;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(body))
+                        return TrimForMessage(body, 240);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(ex.Message))
+                return ex.Message;
+
+            return ex.Status.ToString();
+        }
+
+        string TrimForMessage(string value, int maxLength)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+                return value;
+            return value.Substring(0, maxLength) + "...";
         }
 
         string FindFileRecursive(string dir, string fileName)
@@ -2935,6 +3327,63 @@ namespace MihomoTray
             {
                 DestroyIcon(hIcon);
             }
+        }
+    }
+
+    class WebResponseStream : Stream
+    {
+        readonly WebResponse _response;
+        readonly Stream _stream;
+
+        public WebResponseStream(WebResponse response, Stream stream)
+        {
+            _response = response;
+            _stream = stream;
+        }
+
+        public override bool CanRead { get { return _stream.CanRead; } }
+        public override bool CanSeek { get { return _stream.CanSeek; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { return _stream.Length; } }
+        public override long Position
+        {
+            get { return _stream.Position; }
+            set { _stream.Position = value; }
+        }
+
+        public override void Flush()
+        {
+            _stream.Flush();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            return _stream.Read(buffer, offset, count);
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            return _stream.Seek(offset, origin);
+        }
+
+        public override void SetLength(long value)
+        {
+            _stream.SetLength(value);
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            throw new NotSupportedException();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                try { _stream.Dispose(); } catch { }
+                try { _response.Close(); } catch { }
+            }
+            base.Dispose(disposing);
         }
     }
 
