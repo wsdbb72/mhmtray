@@ -181,9 +181,9 @@ namespace MihomoTray
             _trayIcon = new NotifyIcon();
             _trayIcon.Visible = true;
 
-            _iconRunning = IconFromBase64(EmbeddedIcons.OnBase64);
-            _iconStopped = IconFromBase64(EmbeddedIcons.OffBase64);
-            _iconWarn = IconFromBase64(EmbeddedIcons.WarnBase64);
+            _iconRunning = CreateStatusLightIcon(Color.FromArgb(52, 199, 89), Color.FromArgb(36, 146, 68));
+            _iconStopped = CreateStatusLightIcon(Color.FromArgb(151, 160, 168), Color.FromArgb(112, 121, 128));
+            _iconWarn = CreateStatusLightIcon(Color.FromArgb(52, 199, 89), Color.FromArgb(36, 146, 68));
 
             BuildMenu();
             LoadTrayConfig();
@@ -2644,19 +2644,24 @@ namespace MihomoTray
 
         Icon CreateFallbackIcon(Color color)
         {
+            return CreateStatusLightIcon(color, Color.FromArgb(105, 105, 105));
+        }
+
+        Icon CreateStatusLightIcon(Color fill, Color border)
+        {
             int size = 32;
             var bmp = new Bitmap(size, size);
             using (var g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.Clear(Color.Transparent);
-                using (var brush = new SolidBrush(color))
+                using (var brush = new SolidBrush(fill))
                 {
-                    g.FillEllipse(brush, 4, 4, 24, 24);
+                    g.FillEllipse(brush, 5, 5, 22, 22);
                 }
-                using (var pen = new Pen(Color.FromArgb(60, 0, 0, 0), 1.5f))
+                using (var pen = new Pen(border, 1.4f))
                 {
-                    g.DrawEllipse(pen, 4, 4, 24, 24);
+                    g.DrawEllipse(pen, 5, 5, 22, 22);
                 }
             }
             using (bmp)
