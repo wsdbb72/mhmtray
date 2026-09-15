@@ -103,6 +103,27 @@ namespace MihomoTray
         DateTime _lastSystemProxyReadUtc;
         Dictionary<string, AssetVersionInfo> _assetVersions = new Dictionary<string, AssetVersionInfo>(StringComparer.OrdinalIgnoreCase);
 
+        // ──── 菜单快照缓存（解决右键菜单卡顿）────
+        // 进程枚举（Process.GetProcessesByName）与被代理进程名的文件/正则解析
+        // 实测合计约 1.8 秒；把它们放在 UI 线程上会让右键菜单严重延迟弹出，
+        // 并出现"菜单跟着鼠标跑"的错位现象（Windows 在迟到的那一刻才定位菜单）。
+        // 因此改为：后台线程按固定间隔刷新快照，UI 线程只读快照（纯内存，微秒级）。
+        volatile bool _snapshotMihomoRunning;
+        volatile bool _snapshotTunEnabled;
+        volatile bool _snapshotSystemProxyOn;
+        volatile bool _snapshotProxiFyreInstalled;
+        volatile bool _snapshotProxiFyreRunning;
+        /// <summary>快照中的 ProxiFyre 上游端点（已含"是否在监听"的探测结果）。</summary>
+        volatile string _snapshotProxiFyreEndpoint;
+        volatile bool _snapshotProxiFyreEndpointAlive;
+        /// <summary>快照中的被代理进程名列表；替换引用是原子的，UI 线程只读。</summary>
+        volatile List<string> _snapshotProxiFyreAppNames = new List<string>();
+        /// <summary>快照是否已完成首轮填充。未填充时菜单走"加载中"占位，避免显示错误状态。</summary>
+        volatile bool _snapshotReady;
+        System.Threading.Timer _snapshotTimer;
+        /// <summary>同一时刻只允许一个后台刷新在跑，避免计时器重入导致进程枚举风暴。</summary>
+        int _snapshotRefreshBusy;
+
         bool _isAdmin;
 
         ToolStripMenuItem _statusItem;
@@ -124,9 +145,16 @@ namespace MihomoTray
         ToolStripMenuItem _panelSettingsItem;
         ToolStripMenuItem _updateAssetsItem;
 
+        // 托盘图标（KY 字母 + 右上角指示灯，设计保持不变）：
+        //   _iconRunning -> 绿灯   仅系统代理
+        //   _iconTun     -> 蓝灯   TUN 已开启
+        //   _iconStopped -> 红灯   都未开 / 核心未运行
+        //   _iconWarn    -> 黄灯   保留资产（旧版"已运行但未接管流量"语义），
+        //                          当前状态机不再使用，避免删资源影响历史兼容。
         Icon _iconRunning;
         Icon _iconStopped;
         Icon _iconWarn;
+        Icon _iconTun;
 
         List<ConfigProfile> _profiles = new List<ConfigProfile>();
 
@@ -273,6 +301,7 @@ namespace MihomoTray
             _iconRunning = IconFromBase64(EmbeddedIcons.OnBase64);
             _iconStopped = IconFromBase64(EmbeddedIcons.OffBase64);
             _iconWarn = IconFromBase64(EmbeddedIcons.WarnBase64);
+            _iconTun = IconFromBase64(EmbeddedIcons.TunBase64);
 
             BuildMenu();
             LoadTrayConfig();
@@ -299,6 +328,13 @@ namespace MihomoTray
             };
             _statusTimer.Start();
 
+            // 后台状态快照：这是菜单流畅的关键。
+            // 首轮由 RefreshUI() 同步采集（启动瞬间一次，可接受），
+            // 之后由该计时器周期性异步刷新，UI 线程永不枚举进程。
+            _snapshotTimer = new System.Threading.Timer(
+                delegate { RequestSnapshotRefresh(); },
+                null, SnapshotIntervalMs, SnapshotIntervalMs);
+
             _systemProxyGuardTimer = new System.Windows.Forms.Timer();
             _systemProxyGuardTimer.Interval = 30000;
             _systemProxyGuardTimer.Tick += delegate
@@ -317,6 +353,7 @@ namespace MihomoTray
                 _lastTunEnabled = ReadTunStatus();
             try { SaveTrayConfig(); } catch { }
             if (_statusTimer != null) { _statusTimer.Stop(); _statusTimer.Dispose(); _statusTimer = null; }
+            if (_snapshotTimer != null) { _snapshotTimer.Dispose(); _snapshotTimer = null; }
             if (_systemProxyGuardTimer != null) { _systemProxyGuardTimer.Stop(); _systemProxyGuardTimer.Dispose(); _systemProxyGuardTimer = null; }
             if (IsMihomoSystemProxyActive())
             {
@@ -326,6 +363,7 @@ namespace MihomoTray
             if (_iconRunning != null) { _iconRunning.Dispose(); _iconRunning = null; }
             if (_iconWarn != null) { _iconWarn.Dispose(); _iconWarn = null; }
             if (_iconStopped != null) { _iconStopped.Dispose(); _iconStopped = null; }
+            if (_iconTun != null) { _iconTun.Dispose(); _iconTun = null; }
             if (_trayIcon != null) { _trayIcon.Visible = false; _trayIcon.Dispose(); _trayIcon = null; }
         }
 
@@ -419,6 +457,15 @@ namespace MihomoTray
 
             _menu.Items.Add(new ToolStripSeparator());
 
+            // 按应用代理（ProxiFyre 联动）
+            // 提升到顶层：这是本程序的核心差异化功能之一，原先埋在"工具"子菜单里
+            // 导致用户反馈"没看见 ProxiFyre 相关设置"。顶层入口保证可发现性。
+            _appProxyMenu = new ToolStripMenuItem("按应用代理（ProxiFyre）");
+            _appProxyMenu.Image = UiStyles.MenuIcon("appproxy", false);
+            _menu.Items.Add(_appProxyMenu);
+
+            _menu.Items.Add(new ToolStripSeparator());
+
             var configMenu = new ToolStripMenuItem("配置与订阅");
             configMenu.Image = UiStyles.MenuIcon("profile", false);
             _profileItem = new ToolStripMenuItem("配置切换", null, OnProfileManager);
@@ -440,11 +487,6 @@ namespace MihomoTray
 
             var toolsMenu = new ToolStripMenuItem("工具");
             toolsMenu.Image = UiStyles.MenuIcon("settings", false);
-
-            // 按应用代理（ProxiFyre 联动）
-            _appProxyMenu = new ToolStripMenuItem("按应用代理");
-            _appProxyMenu.Image = UiStyles.MenuIcon("appproxy", false);
-            toolsMenu.DropDownItems.Add(_appProxyMenu);
 
             _panelSettingsItem = new ToolStripMenuItem("面板设置", null, OnPanelSettings);
             _panelSettingsItem.Image = UiStyles.MenuIcon("settings", false);
@@ -486,34 +528,261 @@ namespace MihomoTray
 
         void OnMenuOpening(object sender, CancelEventArgs e)
         {
-            _lastMihomoProcessLookupUtc = DateTime.MinValue;
-            RefreshUI();
-            RefreshSubscriptions();
-            RefreshAppProxyMenu();
+            // 性能要求：这里必须"零阻塞"。
+            // 之前此处会同步做进程枚举 + 文件解析 + TCP 探测，实测合计约 1804ms，
+            // 导致菜单延迟弹出、并且因为延时期间鼠标已移动而"跟着鼠标跑"。
+            // 现在一律只读后台快照（纯内存字段），如果快照尚未就绪则立刻触发一次
+            // 异步刷新并显示"加载中"，绝不在 UI 线程上等结果。
+            if (!_snapshotReady)
+            {
+                RequestSnapshotRefresh();
+                ShowMenuLoadingPlaceholder();
+                return;
+            }
+
+            ApplySnapshotToMenu();
+            // 顺带异步刷新一次，让下次打开更"新鲜"，但不阻塞本次
+            RequestSnapshotRefresh();
         }
 
-        /// <summary>重建「按应用代理」子菜单：列出已配置进程，可勾选启停。</summary>
-        void RefreshAppProxyMenu()
+        /// <summary>快照未就绪时的菜单占位，避免显示错误的初始状态。</summary>
+        void ShowMenuLoadingPlaceholder()
+        {
+            _statusItem.Text = "Mihomo - 读取中…";
+            _statusItem.Image = UiStyles.MenuIcon("status-off", false);
+            if (_appProxyMenu != null)
+            {
+                _appProxyMenu.DropDownItems.Clear();
+                var loading = new ToolStripMenuItem("(读取中…)");
+                loading.Enabled = false;
+                loading.Image = UiStyles.MenuIcon("empty", false);
+                _appProxyMenu.DropDownItems.Add(loading);
+                UiStyles.ApplyMenuItems(_appProxyMenu.DropDown);
+            }
+        }
+
+        // ──── 后台状态快照 ────
+        //
+        // 把"贵"的状态采集（进程枚举、ProxiFyre 配置解析、端口探测）全部搬到后台线程，
+        // UI 线程只读 volatile 字段。这是解决菜单卡顿的关键结构性改动。
+        //
+        // 刷新节奏：启动时立刻来一次；之后由计时器按 SnapshotIntervalMs 周期性刷新。
+        // 菜单打开时若快照已就绪则直接渲染，并触发一次异步刷新以提升下次的新鲜度。
+
+        /// <summary>后台快照刷新间隔。3 秒足够跟上进程启停，又不会造成枚举风暴。</summary>
+        const int SnapshotIntervalMs = 3000;
+
+        /// <summary>请求一次后台快照刷新。多次请求会合并，不会并发重入。</summary>
+        void RequestSnapshotRefresh()
+        {
+            if (Interlocked.CompareExchange(ref _snapshotRefreshBusy, 1, 0) != 0)
+                return;
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    CaptureSnapshot();
+                }
+                catch { }
+                finally
+                {
+                    Interlocked.Exchange(ref _snapshotRefreshBusy, 0);
+                }
+            });
+        }
+
+        /// <summary>
+        /// 在后台线程采集一次完整状态。注意：本方法内不得触碰任何 UI 控件。
+        /// </summary>
+        void CaptureSnapshot()
+        {
+            // 1) 核心进程：直接走全量枚举（跳过 CheckMihomoStatus 的 5 秒缓存，
+            //    因为本方法本来就只在后台低频执行）。
+            bool mihomoRunning;
+            try
+            {
+                var procs = FindManagedMihomoProcesses();
+                mihomoRunning = procs.Count > 0;
+                foreach (var p in procs) { try { p.Dispose(); } catch { } }
+            }
+            catch { mihomoRunning = false; }
+
+            // 2) TUN / 系统代理：读配置与注册表（相对便宜，但仍放后台）
+            bool tunEnabled = false;
+            bool proxyOn = false;
+            try { tunEnabled = ReadTunStatus(); } catch { }
+            try { proxyOn = IsMihomoSystemProxyActive(); } catch { }
+
+            // 3) ProxiFyre 状态
+            bool pfInstalled = false;
+            bool pfRunning = false;
+            var appNames = new List<string>();
+            string endpoint = null;
+            bool endpointAlive = false;
+
+            try { pfInstalled = IsProxiFyreInstalled(); } catch { }
+            if (pfInstalled)
+            {
+                try { pfRunning = IsProxiFyreRunning(); } catch { }
+                try { appNames = ReadProxiFyreAppNames(); } catch { appNames = new List<string>(); }
+                try
+                {
+                    endpoint = ResolveProxiFyreEndpoint();
+                    int epPort;
+                    endpointAlive = !string.IsNullOrEmpty(endpoint)
+                        && TryExtractPort(endpoint, out epPort)
+                        && IsLocalPortListening(epPort);
+                }
+                catch { }
+            }
+
+            // 4) 一次性发布（先写数据，最后置 Ready，保证 UI 读到的是自洽的一组值）
+            _snapshotMihomoRunning = mihomoRunning;
+            _snapshotTunEnabled = tunEnabled;
+            _snapshotSystemProxyOn = proxyOn;
+            _snapshotProxiFyreInstalled = pfInstalled;
+            _snapshotProxiFyreRunning = pfRunning;
+            _snapshotProxiFyreAppNames = appNames;
+            _snapshotProxiFyreEndpoint = endpoint;
+            _snapshotProxiFyreEndpointAlive = endpointAlive;
+            _snapshotReady = true;
+        }
+
+        /// <summary>
+        /// 用当前快照渲染整个菜单。纯内存操作，UI 线程上开销在微秒级。
+        /// </summary>
+        void ApplySnapshotToMenu()
+        {
+            bool running = _snapshotMihomoRunning;
+            bool tunOn = _snapshotTunEnabled;
+            bool proxyOn = _snapshotSystemProxyOn;
+            string adminTag = _isAdmin ? " [管理员]" : " [普通权限]";
+
+            if (running)
+            {
+                _startStopItem.Text = "停止 Mihomo";
+                _startStopItem.Image = UiStyles.MenuIcon("stop", false);
+                _trayIcon.Text = "Mihomo - 运行中"
+                    + (tunOn ? " (TUN:开启)" : "")
+                    + (proxyOn ? " (代理:开启)" : "")
+                    + adminTag;
+                if (_statusItem != null)
+                {
+                    _statusItem.Text = "Mihomo - 运行中" + adminTag;
+                    _statusItem.Image = UiStyles.MenuIcon("status-on", false);
+                }
+
+                // 托盘灯语义（用户指定）：
+                //   TUN 已开启  -> 蓝灯
+                //   仅系统代理  -> 绿灯
+                //   两者都没开  -> 红灯
+                if (tunOn)
+                    _trayIcon.Icon = _iconTun;
+                else if (proxyOn)
+                    _trayIcon.Icon = _iconRunning;
+                else
+                    _trayIcon.Icon = _iconStopped;
+            }
+            else
+            {
+                _startStopItem.Text = "启动 Mihomo";
+                _startStopItem.Image = UiStyles.MenuIcon("play", false);
+                _trayIcon.Icon = _iconStopped;
+                _trayIcon.Text = "Mihomo - 已停止" + adminTag;
+                if (_statusItem != null)
+                {
+                    _statusItem.Text = "Mihomo - 已停止" + adminTag;
+                    _statusItem.Image = UiStyles.MenuIcon("status-off", false);
+                }
+            }
+
+            _tunItem.Checked = tunOn;
+            _tunItem.Text = tunOn ? "TUN 模式已开启" : "TUN 模式";
+            _tunItem.Image = UiStyles.MenuIcon("tun", tunOn);
+
+            RefreshModeMenuFromSnapshot(running);
+
+            _proxyItem.Checked = _systemProxyDesired;
+            if (_systemProxyDesired && !proxyOn)
+                _proxyItem.Text = _systemProxyGuardEnabled
+                    ? "系统代理修复中"
+                    : "系统代理未指向本程序";
+            else
+                _proxyItem.Text = proxyOn ? "系统代理已开启" : "系统代理";
+            _proxyItem.Image = UiStyles.MenuIcon("proxy", _systemProxyDesired && proxyOn);
+
+            if (_proxyGuardItem != null)
+            {
+                _proxyGuardItem.Checked = _systemProxyGuardEnabled;
+                _proxyGuardItem.Text = "系统代理守护";
+                _proxyGuardItem.Image = UiStyles.MenuIcon("guard", _systemProxyGuardEnabled);
+            }
+
+            if (_runMihomoItem != null)
+            {
+                _runMihomoItem.Checked = _runMihomoOnStartup;
+                _runMihomoItem.Image = UiStyles.MenuIcon("startup", _runMihomoOnStartup);
+            }
+
+            if (_autoStartItem != null)
+            {
+                _autoStartItem.Checked = IsAutoStartEnabled();
+                _autoStartItem.Image = UiStyles.MenuIcon("power", _autoStartItem.Checked);
+            }
+
+            ApplySnapshotToAppProxyMenu();
+        }
+
+        /// <summary>用快照渲染规则模式子菜单（避免在 UI 线程再次枚举进程）。</summary>
+        void RefreshModeMenuFromSnapshot(bool running)
+        {
+            if (_modeMenu == null)
+                return;
+
+            string mode = ResolveCurrentMode();
+            if (_modeRuleItem != null) _modeRuleItem.Checked = mode == ModeRule;
+            if (_modeGlobalItem != null) _modeGlobalItem.Checked = mode == ModeGlobal;
+            if (_modeDirectItem != null) _modeDirectItem.Checked = mode == ModeDirect;
+
+            _modeMenu.Text = running
+                ? "规则模式：" + DescribeMode(mode)
+                : "规则模式：" + DescribeMode(mode) + "（未运行）";
+            _modeMenu.Image = UiStyles.MenuIcon("mode", mode != ModeRule);
+        }
+
+        /// <summary>
+        /// 用快照重建「按应用代理」子菜单。纯内存操作，不做任何进程枚举或 I/O。
+        /// 这是菜单渲染的唯一入口；真实状态由后台快照线程负责更新。
+        /// </summary>
+        void ApplySnapshotToAppProxyMenu()
         {
             if (_appProxyMenu == null)
                 return;
 
             _appProxyMenu.DropDownItems.Clear();
 
-            if (!IsProxiFyreInstalled())
+            if (!_snapshotProxiFyreInstalled)
             {
                 var missing = new ToolStripMenuItem("(未检测到 ProxiFyre)");
                 missing.Enabled = false;
                 missing.Image = UiStyles.MenuIcon("empty", false);
                 _appProxyMenu.DropDownItems.Add(missing);
+
+                // 即便未安装，也把入口留在菜单里，避免用户完全找不到该功能
+                _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
+                var hint = new ToolStripMenuItem("ProxiFyre 未安装 · 点此查看说明", null, OnShowProxiFyreHelp);
+                hint.Image = UiStyles.MenuIcon("list", false);
+                _appProxyMenu.DropDownItems.Add(hint);
+
                 _appProxyMenu.Text = "按应用代理";
                 _appProxyMenu.Image = UiStyles.MenuIcon("appproxy", false);
                 UiStyles.ApplyMenuItems(_appProxyMenu.DropDown);
                 return;
             }
 
-            bool running = IsProxiFyreRunning();
-            var names = ReadProxiFyreAppNames();
+            bool running = _snapshotProxiFyreRunning;
+            var names = _snapshotProxiFyreAppNames ?? new List<string>();
 
             var status = new ToolStripMenuItem(
                 running
@@ -524,11 +793,10 @@ namespace MihomoTray
             status.Tag = "caption";
             _appProxyMenu.DropDownItems.Add(status);
 
-            string endpoint = ResolveProxiFyreEndpoint();
+            string endpoint = _snapshotProxiFyreEndpoint;
             if (!string.IsNullOrEmpty(endpoint))
             {
-                int epPort;
-                bool alive = TryExtractPort(endpoint, out epPort) && IsLocalPortListening(epPort);
+                bool alive = _snapshotProxiFyreEndpointAlive;
                 string suffix = _proxiFyrePortOverride > 0 ? "（已自定义）" : "";
                 var ep = new ToolStripMenuItem(
                     "上游 " + endpoint + suffix + (alive ? " · 可用" : " · 未监听"));
@@ -538,7 +806,6 @@ namespace MihomoTray
                 ep.Image = UiStyles.MenuIcon(alive ? "status-on" : "status-off", alive);
                 _appProxyMenu.DropDownItems.Add(ep);
 
-                // 未监听时给一个一键修正入口，避免用户手算端口
                 if (!alive)
                 {
                     var probe = new ToolStripMenuItem("自动检测可用端口…", null, OnAutoDetectProxiFyrePort);
@@ -571,11 +838,10 @@ namespace MihomoTray
 
             _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
 
-            // 一键启停：控制全部游戏进程的按应用代理
             _appProxyAllItem = new ToolStripMenuItem("启用全部代理", null, OnToggleAllAppProxy);
             _appProxyAllItem.Image = UiStyles.MenuIcon("appproxy", false);
             _appProxyAllItem.Checked = names.Count > 0;
-            _appProxyAllItem.Enabled = IsProxiFyreInstalled();
+            _appProxyAllItem.Enabled = _snapshotProxiFyreInstalled;
             _appProxyMenu.DropDownItems.Add(_appProxyAllItem);
 
             _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
@@ -589,7 +855,7 @@ namespace MihomoTray
             _appProxyMenu.DropDownItems.Add(manageItem);
 
             var portItem = new ToolStripMenuItem(
-                string.Format("设置代理端口…（当前 {0}）", ExtractPort(ResolveProxiFyreEndpoint())),
+                string.Format("设置代理端口…（当前 {0}）", ExtractPort(endpoint)),
                 null, OnEditProxiFyrePort);
             portItem.Image = UiStyles.MenuIcon("edit", false);
             _appProxyMenu.DropDownItems.Add(portItem);
@@ -604,6 +870,19 @@ namespace MihomoTray
             _appProxyMenu.Image = UiStyles.MenuIcon("appproxy", running);
 
             UiStyles.ApplyMenuItems(_appProxyMenu.DropDown);
+        }
+
+        /// <summary>ProxiFyre 未安装时的说明入口，保证功能"可发现"。</summary>
+        void OnShowProxiFyreHelp(object sender, EventArgs e)
+        {
+            MessageBox.Show(
+                "未在本机检测到 ProxiFyre。\n\n" +
+                "「按应用代理」依赖 ProxiFyre（基于 Windows Packet Filter 驱动），" +
+                "它可以让指定进程（如游戏）的流量单独走代理，而不影响系统其他程序。\n\n" +
+                "预期安装位置：\n" + ProxiFyreDir + "\n\n" +
+                "安装后重启本程序，该菜单即会列出可管理的应用。",
+                "按应用代理 · 说明",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         /// <summary>从 "host:port" 中取出端口部分；失败时原样返回。</summary>
@@ -906,101 +1185,24 @@ namespace MihomoTray
 
         void RefreshUI()
         {
-            bool running = IsMihomoRunning();
-            bool tunOn = ReadTunStatus();
-            bool proxyOn = IsMihomoSystemProxyActive();
-            int httpPort = ReadHttpPort();
-            string adminTag = _isAdmin ? " [管理员]" : " [普通权限]";
-
-            if (running)
+            // 兼容既有调用点：所有"操作后刷新"都走这里。
+            // 现在只读快照渲染（零阻塞），并异步请求一次后台刷新，
+            // 这样用户操作后界面立刻响应，真实状态在几十毫秒后自动校正。
+            if (!_snapshotReady)
             {
-                _startStopItem.Text = "停止 Mihomo";
-                _startStopItem.Image = UiStyles.MenuIcon("stop", false);
-                _trayIcon.Text = "Mihomo - 运行中"
-                    + (tunOn ? " (TUN:开启)" : "")
-                    + (proxyOn ? " (代理:开启)" : "")
-                    + adminTag;
-                if (_statusItem != null)
-                {
-                    _statusItem.Text = "Mihomo - 运行中" + adminTag;
-                    _statusItem.Image = UiStyles.MenuIcon("status-on", false);
-                }
-                if (!tunOn && !proxyOn)
-                    _trayIcon.Icon = _iconWarn;
-                else
-                    _trayIcon.Icon = _iconRunning;
-            }
-            else
-            {
-                _startStopItem.Text = "启动 Mihomo";
-                _startStopItem.Image = UiStyles.MenuIcon("play", false);
-                _trayIcon.Icon = _iconStopped;
-                _trayIcon.Text = "Mihomo - 已停止" + adminTag;
-                if (_statusItem != null)
-                {
-                    _statusItem.Text = "Mihomo - 已停止" + adminTag;
-                    _statusItem.Image = UiStyles.MenuIcon("status-off", false);
-                }
+                // 快照还没好：同步采集一次，保证启动路径能立刻显示正确状态。
+                // 这只在启动瞬间发生一次，不影响菜单交互性能。
+                try { CaptureSnapshot(); } catch { }
             }
 
-            _tunItem.Checked = tunOn;
-            _tunItem.Text = tunOn ? "TUN 模式已开启" : "TUN 模式";
-            _tunItem.Image = UiStyles.MenuIcon("tun", tunOn);
-
-            RefreshModeMenu();
-
-            _proxyItem.Checked = _systemProxyDesired;
-            if (_systemProxyDesired && !proxyOn)
-                _proxyItem.Text = _systemProxyGuardEnabled
-                    ? "系统代理修复中"
-                    : "系统代理未指向本程序";
-            else
-                _proxyItem.Text = proxyOn ? "系统代理已开启" : "系统代理";
-            _proxyItem.Image = UiStyles.MenuIcon("proxy", _systemProxyDesired && proxyOn);
-
-            if (_proxyGuardItem != null)
-            {
-                _proxyGuardItem.Checked = _systemProxyGuardEnabled;
-                _proxyGuardItem.Text = "系统代理守护";
-                _proxyGuardItem.Image = UiStyles.MenuIcon("guard", _systemProxyGuardEnabled);
-            }
-
-            if (_runMihomoItem != null)
-            {
-                _runMihomoItem.Checked = _runMihomoOnStartup;
-                _runMihomoItem.Image = UiStyles.MenuIcon("startup", _runMihomoOnStartup);
-            }
-
-            if (_autoStartItem != null)
-            {
-                _autoStartItem.Checked = IsAutoStartEnabled();
-                _autoStartItem.Image = UiStyles.MenuIcon("power", _autoStartItem.Checked);
-            }
+            ApplySnapshotToMenu();
+            RequestSnapshotRefresh();
         }
 
         /// <summary>同步规则模式子菜单的勾选状态与标题。</summary>
         void RefreshModeMenu()
         {
-            if (_modeMenu == null)
-                return;
-
-            string mode = ResolveCurrentMode();
-            bool running = IsMihomoRunning();
-
-            if (_modeRuleItem != null) _modeRuleItem.Checked = mode == ModeRule;
-            if (_modeGlobalItem != null) _modeGlobalItem.Checked = mode == ModeGlobal;
-            if (_modeDirectItem != null) _modeDirectItem.Checked = mode == ModeDirect;
-
-            if (running)
-            {
-                _modeMenu.Text = "规则模式：" + DescribeMode(mode);
-            }
-            else
-            {
-                // 核心未运行，模式仅供参考（来自配置文件）
-                _modeMenu.Text = "规则模式：" + DescribeMode(mode) + "（未运行）";
-            }
-            _modeMenu.Image = UiStyles.MenuIcon("mode", mode != ModeRule);
+            RefreshModeMenuFromSnapshot(_snapshotMihomoRunning);
         }
 
         void InitializeSavedProxyModes()
