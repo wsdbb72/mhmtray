@@ -113,6 +113,7 @@ namespace MihomoTray
         ToolStripMenuItem _subMenu;
         ToolStripMenuItem _subMgrItem;
         ToolStripMenuItem _profileItem;
+        ToolStripMenuItem _appProxyMenu;
         ToolStripMenuItem _autoStartItem;
         ToolStripMenuItem _runMihomoItem;
         ToolStripMenuItem _panelSettingsItem;
@@ -211,6 +212,7 @@ namespace MihomoTray
             RegexOptions.IgnoreCase);
         static readonly Regex HttpPortRegex = new Regex(@"(?m)^port:\s*(\d+)");
         static readonly Regex MixedPortRegex = new Regex(@"(?m)^mixed-port:\s*(\d+)");
+        static readonly Regex SocksPortRegex = new Regex(@"(?m)^socks-port:\s*(\d+)");
         static readonly Regex TunBlockRegex = new Regex(
             @"(?ms)^tun:\s*\r?\n(?<body>(?:^[ \t]+[^\r\n]*(?:\r?\n|$))*)",
             RegexOptions.IgnoreCase);
@@ -430,6 +432,12 @@ namespace MihomoTray
 
             var toolsMenu = new ToolStripMenuItem("工具");
             toolsMenu.Image = UiStyles.MenuIcon("settings", false);
+
+            // 按应用代理（ProxiFyre 联动）
+            _appProxyMenu = new ToolStripMenuItem("按应用代理");
+            _appProxyMenu.Image = UiStyles.MenuIcon("appproxy", false);
+            toolsMenu.DropDownItems.Add(_appProxyMenu);
+
             _panelSettingsItem = new ToolStripMenuItem("面板设置", null, OnPanelSettings);
             _panelSettingsItem.Image = UiStyles.MenuIcon("settings", false);
             toolsMenu.DropDownItems.Add(_panelSettingsItem);
@@ -473,6 +481,132 @@ namespace MihomoTray
             _lastMihomoProcessLookupUtc = DateTime.MinValue;
             RefreshUI();
             RefreshSubscriptions();
+            RefreshAppProxyMenu();
+        }
+
+        /// <summary>重建「按应用代理」子菜单：列出已配置进程，可勾选启停。</summary>
+        void RefreshAppProxyMenu()
+        {
+            if (_appProxyMenu == null)
+                return;
+
+            _appProxyMenu.DropDownItems.Clear();
+
+            if (!IsProxiFyreInstalled())
+            {
+                var missing = new ToolStripMenuItem("(未检测到 ProxiFyre)");
+                missing.Enabled = false;
+                missing.Image = UiStyles.MenuIcon("empty", false);
+                _appProxyMenu.DropDownItems.Add(missing);
+                _appProxyMenu.Text = "按应用代理";
+                _appProxyMenu.Image = UiStyles.MenuIcon("appproxy", false);
+                UiStyles.ApplyMenuItems(_appProxyMenu.DropDown);
+                return;
+            }
+
+            bool running = IsProxiFyreRunning();
+            var names = ReadProxiFyreAppNames();
+
+            var status = new ToolStripMenuItem(
+                running
+                    ? string.Format("ProxiFyre 运行中 · {0} 个应用", names.Count)
+                    : string.Format("ProxiFyre 已停止 · {0} 个应用", names.Count));
+            status.Enabled = false;
+            status.Image = UiStyles.MenuIcon(running ? "status-on" : "status-off", running);
+            status.Tag = "caption";
+            _appProxyMenu.DropDownItems.Add(status);
+
+            string endpoint = ReadProxiFyreEndpoint();
+            if (!string.IsNullOrEmpty(endpoint))
+            {
+                var ep = new ToolStripMenuItem("上游 " + endpoint);
+                ep.Enabled = false;
+                ep.Image = UiStyles.MenuIcon("empty", false);
+                _appProxyMenu.DropDownItems.Add(ep);
+            }
+
+            _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
+
+            if (names.Count == 0)
+            {
+                var none = new ToolStripMenuItem("(尚未选择应用)");
+                none.Enabled = false;
+                none.Image = UiStyles.MenuIcon("empty", false);
+                _appProxyMenu.DropDownItems.Add(none);
+            }
+            else
+            {
+                foreach (var name in names)
+                {
+                    string captured = name;
+                    var item = new ToolStripMenuItem(captured, null,
+                        delegate { ToggleProxiFyreApp(captured, false); });
+                    item.Checked = true;
+                    item.Image = UiStyles.MenuIcon("app", false);
+                    _appProxyMenu.DropDownItems.Add(item);
+                }
+            }
+
+            _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
+
+            var addItem = new ToolStripMenuItem("添加应用…", null, OnAddAppProxy);
+            addItem.Image = UiStyles.MenuIcon("plus", false);
+            _appProxyMenu.DropDownItems.Add(addItem);
+
+            var manageItem = new ToolStripMenuItem("管理应用列表…", null, OnManageAppProxy);
+            manageItem.Image = UiStyles.MenuIcon("list", false);
+            _appProxyMenu.DropDownItems.Add(manageItem);
+
+            var restartItem = new ToolStripMenuItem("重启 ProxiFyre 服务", null, OnRestartAppProxy);
+            restartItem.Image = UiStyles.MenuIcon("refresh", false);
+            _appProxyMenu.DropDownItems.Add(restartItem);
+
+            _appProxyMenu.Text = running
+                ? string.Format("按应用代理（{0}）", names.Count)
+                : "按应用代理（停止）";
+            _appProxyMenu.Image = UiStyles.MenuIcon("appproxy", running);
+
+            UiStyles.ApplyMenuItems(_appProxyMenu.DropDown);
+        }
+
+        void OnAddAppProxy(object sender, EventArgs e)
+        {
+            string name = AppProxyEditForm.Prompt(this, "添加应用", "");
+            if (string.IsNullOrEmpty(name))
+                return;
+            ToggleProxiFyreApp(name, true);
+        }
+
+        void OnManageAppProxy(object sender, EventArgs e)
+        {
+            using (var dlg = new AppProxyManagerForm(ReadProxiFyreAppNames(), ReadProxiFyreEndpoint()))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                string error;
+                if (!WriteProxiFyreAppNames(dlg.GetAppNames(), out error))
+                {
+                    _trayIcon.ShowBalloonTip(3000, "Mihomo", "写入失败：" + error, ToolTipIcon.Error);
+                    return;
+                }
+                if (!RestartProxiFyreService(out error))
+                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                        "配置已保存，但重启服务失败：" + error, ToolTipIcon.Warning);
+                else
+                    _trayIcon.ShowBalloonTip(2000, "Mihomo", "按应用代理列表已更新", ToolTipIcon.Info);
+                RefreshUI();
+            }
+        }
+
+        void OnRestartAppProxy(object sender, EventArgs e)
+        {
+            string error;
+            if (RestartProxiFyreService(out error))
+                _trayIcon.ShowBalloonTip(2000, "Mihomo", "ProxiFyre 服务已重启", ToolTipIcon.Info);
+            else
+                _trayIcon.ShowBalloonTip(3000, "Mihomo", "重启失败：" + error, ToolTipIcon.Warning);
+            RefreshUI();
         }
 
         // ──── Refresh UI ────
@@ -2841,6 +2975,383 @@ namespace MihomoTray
             }
         }
 
+        // ──── ProxiFyre 按应用代理集成 ────
+        // ProxiFyre 借助 Windows Packet Filter (NDISAPI) 驱动按进程名重定向流量，
+        // 与本程序的 TUN 模式互不冲突，且不需要 TUN。本程序只做管理：
+        // 读写 app-config.json、控制 ProxiFyreService 启停，不复用其驱动逻辑。
+
+        string ProxiFyreDir
+        {
+            get
+            {
+                // 优先用环境变量，避免 32 位进程被重定向到 Program Files (x86)
+                string programFiles = Environment.GetEnvironmentVariable("ProgramW6432");
+                if (string.IsNullOrEmpty(programFiles))
+                    programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+                return Path.Combine(programFiles, "ProxiFyre");
+            }
+        }
+
+        string ProxiFyreConfigPath
+        {
+            get { return Path.Combine(ProxiFyreDir, "app-config.json"); }
+        }
+
+        string ProxiFyreExePath
+        {
+            get { return Path.Combine(ProxiFyreDir, "ProxiFyre.exe"); }
+        }
+
+        const string ProxiFyreServiceName = "ProxiFyreService";
+        const string ProxiFyreProcessName = "ProxiFyre";
+
+        /// <summary>ProxiFyre 是否已安装到本机。</summary>
+        bool IsProxiFyreInstalled()
+        {
+            try { return File.Exists(ProxiFyreExePath); }
+            catch { return false; }
+        }
+
+        /// <summary>ProxiFyreService 是否正在运行。</summary>
+        bool IsProxiFyreRunning()
+        {
+            try
+            {
+                foreach (var p in Process.GetProcessesByName(ProxiFyreProcessName))
+                {
+                    try { p.Dispose(); } catch { }
+                    return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>本程序当前对外提供的 SOCKS5 端口，供 ProxiFyre 作为上游。</summary>
+        int ReadSocksPort()
+        {
+            try
+            {
+                string content = ReadActiveConfigContent();
+                if (!string.IsNullOrEmpty(content))
+                {
+                    // 优先 socks-port，其次 mixed-port（mixed 同时承载 socks）
+                    foreach (var re in new[] { SocksPortRegex, MixedPortRegex, HttpPortRegex })
+                    {
+                        var m = re.Match(content);
+                        if (m.Success)
+                        {
+                            int port;
+                            if (int.TryParse(m.Groups[1].Value, out port) && port > 0 && port <= 65535)
+                                return port;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return 7890;
+        }
+
+        /// <summary>
+        /// 读取 ProxiFyre 配置中所有被代理的进程名（去重、排序）。
+        /// 用轻量解析而非完整反序列化，避免引入 JSON 序列化依赖。
+        /// </summary>
+        List<string> ReadProxiFyreAppNames()
+        {
+            var names = new List<string>();
+            try
+            {
+                if (!File.Exists(ProxiFyreConfigPath))
+                    return names;
+
+                string json = File.ReadAllText(ProxiFyreConfigPath, Encoding.UTF8);
+                var block = Regex.Match(json, @"""appNames""\s*:\s*\[(?<body>[^\]]*)\]",
+                    RegexOptions.Singleline);
+                foreach (Match m in Regex.Matches(json,
+                    @"""appNames""\s*:\s*\[(?<body>[^\]]*)\]", RegexOptions.Singleline))
+                {
+                    foreach (Match item in Regex.Matches(m.Groups["body"].Value, @"""([^""]+)"""))
+                    {
+                        string name = item.Groups[1].Value.Trim();
+                        if (name.Length > 0 && !names.Contains(name))
+                            names.Add(name);
+                    }
+                }
+            }
+            catch { }
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return names;
+        }
+
+        /// <summary>读取 ProxiFyre 配置的上游 SOCKS5 端点（取第一组的）。</summary>
+        string ReadProxiFyreEndpoint()
+        {
+            try
+            {
+                if (!File.Exists(ProxiFyreConfigPath))
+                    return "";
+                string json = File.ReadAllText(ProxiFyreConfigPath, Encoding.UTF8);
+                var m = Regex.Match(json, @"""socks5ProxyEndpoint""\s*:\s*""([^""]+)""");
+                return m.Success ? m.Groups[1].Value : "";
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// 把进程名列表写回 ProxiFyre 配置。
+        /// 保留原有的分组结构与其它字段（端口、协议、excludes），只调整每个分组内的 appNames：
+        /// 原组内被移除的进程会删除，新加入的进程追加到最后一组，避免破坏用户既有分组语义。
+        /// </summary>
+        bool WriteProxiFyreAppNames(List<string> appNames, out string error)
+        {
+            error = null;
+            try
+            {
+                if (!File.Exists(ProxiFyreConfigPath))
+                {
+                    error = "未找到 app-config.json";
+                    return false;
+                }
+
+                string original = File.ReadAllText(ProxiFyreConfigPath, Encoding.UTF8);
+
+                // 保留原文件中的非 proxies 设置
+                string logLevel = MatchScalar(original, "logLevel", "Error");
+                bool bypassLan = string.Equals(MatchScalar(original, "bypassLan", "false"), "true",
+                    StringComparison.OrdinalIgnoreCase);
+
+                // 逐组重建：先按原顺序保留各组中仍被勾选的进程
+                var desired = new List<string>(appNames ?? new List<string>());
+                var groups = ReadProxiFyreGroups(original);
+                var emitted = new List<string>();
+                var result = new List<List<string>>();
+
+                foreach (var group in groups)
+                {
+                    var kept = new List<string>();
+                    foreach (var name in group)
+                    {
+                        if (ContainsName(desired, name) && !ContainsName(emitted, name))
+                        {
+                            kept.Add(name);
+                            emitted.Add(name);
+                        }
+                    }
+                    if (kept.Count > 0)
+                        result.Add(kept);
+                }
+
+                // 剩余新增的进程并入一组（沿用最后一组的代理设置）
+                var added = new List<string>();
+                foreach (var name in desired)
+                {
+                    if (!ContainsName(emitted, name))
+                    {
+                        added.Add(name);
+                        emitted.Add(name);
+                    }
+                }
+                if (added.Count > 0)
+                    result.Add(added);
+
+                string endpoint = ReadProxiFyreEndpoint();
+                if (string.IsNullOrEmpty(endpoint))
+                    endpoint = "127.0.0.1:" + ReadSocksPort();
+
+                var sb = new StringBuilder();
+                sb.Append("{\r\n");
+                sb.Append("  \"logLevel\": \"").Append(EscapeJson(logLevel)).Append("\",\r\n");
+                sb.Append("  \"bypassLan\": ").Append(bypassLan ? "true" : "false").Append(",\r\n");
+                sb.Append("  \"proxies\": [\r\n");
+                for (int g = 0; g < result.Count; g++)
+                {
+                    sb.Append("    {\r\n");
+                    sb.Append("      \"appNames\": [\r\n");
+                    for (int i = 0; i < result[g].Count; i++)
+                    {
+                        sb.Append("        \"").Append(EscapeJson(result[g][i])).Append("\"");
+                        if (i < result[g].Count - 1) sb.Append(",");
+                        sb.Append("\r\n");
+                    }
+                    sb.Append("      ],\r\n");
+                    sb.Append("      \"socks5ProxyEndpoint\": \"").Append(EscapeJson(endpoint)).Append("\",\r\n");
+                    sb.Append("      \"username\": \"\",\r\n");
+                    sb.Append("      \"password\": \"\",\r\n");
+                    sb.Append("      \"socks5Transport\": \"TCP\",\r\n");
+                    sb.Append("      \"tlsAllowInvalidCertificate\": false,\r\n");
+                    sb.Append("      \"supportedProtocols\": [\r\n        \"TCP\",\r\n        \"UDP\"\r\n      ],\r\n");
+                    sb.Append("      \"supportedAddressFamilies\": [\r\n        \"IPv4\",\r\n        \"IPv6\"\r\n      ]\r\n");
+                    sb.Append("    }");
+                    if (g < result.Count - 1) sb.Append(",");
+                    sb.Append("\r\n");
+                }
+                sb.Append("  ],\r\n");
+                sb.Append("  \"excludes\": []\r\n");
+                sb.Append("}\r\n");
+
+                // 先备份，避免写坏后无法恢复
+                try { File.Copy(ProxiFyreConfigPath, ProxiFyreConfigPath + ".bak", true); } catch { }
+                WriteUtf8FileAtomic(ProxiFyreConfigPath, sb.ToString());
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>按原始顺序读取 ProxiFyre 配置中的分组（每组一个进程名列表）。</summary>
+        static List<List<string>> ReadProxiFyreGroups(string json)
+        {
+            var groups = new List<List<string>>();
+            try
+            {
+                foreach (Match m in Regex.Matches(json,
+                    @"""appNames""\s*:\s*\[(?<body>[^\]]*)\]", RegexOptions.Singleline))
+                {
+                    var group = new List<string>();
+                    foreach (Match item in Regex.Matches(m.Groups["body"].Value, @"""([^""]+)"""))
+                    {
+                        string name = item.Groups[1].Value.Trim();
+                        if (name.Length > 0 && !group.Contains(name))
+                            group.Add(name);
+                    }
+                    if (group.Count > 0)
+                        groups.Add(group);
+                }
+            }
+            catch { }
+            return groups;
+        }
+
+        static bool ContainsName(List<string> list, string name)
+        {
+            foreach (var n in list)
+            {
+                if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        static string MatchScalar(string json, string key, string fallback)
+        {
+            var m = Regex.Match(json, @"""" + Regex.Escape(key) + @"""\s*:\s*""([^""]*)""");
+            return m.Success ? m.Groups[1].Value : fallback;
+        }
+
+        /// <summary>
+        /// 让 ProxiFyre 重新加载配置。ProxiFyre 只在启动时读配置，
+        /// 因此需要重启服务才能生效。
+        /// </summary>
+        bool RestartProxiFyreService(out string error)
+        {
+            error = null;
+            if (!_isAdmin)
+            {
+                error = "需要管理员权限才能重启 ProxiFyreService";
+                return false;
+            }
+
+            try
+            {
+                KillProxiFyreProcesses();
+                RunSc("stop " + ProxiFyreServiceName);
+                Thread.Sleep(1200);
+                string output = RunSc("start " + ProxiFyreServiceName);
+                Thread.Sleep(1500);
+                if (output.IndexOf("失败", StringComparison.Ordinal) >= 0 ||
+                    output.IndexOf("FAILED", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    error = output.Trim();
+                    return false;
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        void KillProxiFyreProcesses()
+        {
+            foreach (var name in new[] { ProxiFyreProcessName, "ProxiFyreUI" })
+            {
+                try
+                {
+                    foreach (var p in Process.GetProcessesByName(name))
+                    {
+                        try { p.Kill(); } catch { }
+                        try { p.Dispose(); } catch { }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>调用 sc.exe 并返回输出。</summary>
+        static string RunSc(string arguments)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("sc.exe", arguments)
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using (var proc = Process.Start(psi))
+                {
+                    string stdout = proc.StandardOutput.ReadToEnd();
+                    string stderr = proc.StandardError.ReadToEnd();
+                    proc.WaitForExit(15000);
+                    return stdout + stderr;
+                }
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
+
+        /// <summary>切换某个进程的代理开关（加入/移出 appNames）。</summary>
+        void ToggleProxiFyreApp(string appName, bool enable)
+        {
+            var names = ReadProxiFyreAppNames();
+            if (enable)
+            {
+                if (!names.Contains(appName)) names.Add(appName);
+            }
+            else
+            {
+                names.RemoveAll(n => string.Equals(n, appName, StringComparison.OrdinalIgnoreCase));
+            }
+
+            string error;
+            if (!WriteProxiFyreAppNames(names, out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo", "写入 ProxiFyre 配置失败：" + error, ToolTipIcon.Error);
+                return;
+            }
+
+            if (!RestartProxiFyreService(out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "配置已保存，但重启 ProxiFyreService 失败：" + error, ToolTipIcon.Warning);
+            }
+            else
+            {
+                string action = enable ? "已加入" : "已移出";
+                _trayIcon.ShowBalloonTip(2000, "Mihomo",
+                    appName + " " + action + "按应用代理", ToolTipIcon.Info);
+            }
+            RefreshUI();
+        }
+
         bool ReadTunStatus()
         {
             try
@@ -5001,6 +5512,154 @@ namespace MihomoTray
         public override Color MenuItemSelected { get { return UiStyles.HoverBack; } }
         public override Color MenuBorder { get { return UiStyles.Border; } }
         public override Color MenuItemBorder { get { return UiStyles.HoverBack; } }
+    }
+
+    /// <summary>
+    /// 管理按应用代理的进程列表（对应 ProxiFyre 的 appNames）。
+    /// </summary>
+    class AppProxyManagerForm : Form
+    {
+        CheckedListBox _list;
+        TextBox _input;
+        List<string> _apps;
+
+        public AppProxyManagerForm(List<string> apps, string endpoint)
+        {
+            Text = "按应用代理";
+            UiStyles.ApplyForm(this);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MinimizeBox = false;
+            MaximizeBox = false;
+            ShowInTaskbar = false;
+            Width = 460;
+            Height = 460;
+
+            _apps = apps == null ? new List<string>() : new List<string>(apps);
+
+            var hint = new Label
+            {
+                Left = 14,
+                Top = 12,
+                Width = 420,
+                Text = string.IsNullOrEmpty(endpoint)
+                    ? "勾选的进程将被代理（进程名需含 .exe）"
+                    : "勾选的进程将被代理，上游 " + endpoint
+            };
+            Controls.Add(hint);
+
+            _list = new CheckedListBox();
+            _list.Left = 14;
+            _list.Top = 36;
+            _list.Width = 420;
+            _list.Height = 320;
+            _list.CheckOnClick = true;
+            _list.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            Controls.Add(_list);
+
+            _input = new TextBox { Left = 14, Top = 366, Width = 330 };
+            _input.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            Controls.Add(_input);
+
+            var addBtn = new Button { Text = "添加", Left = 352, Top = 364, Width = 82 };
+            addBtn.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+            addBtn.Click += delegate
+            {
+                string name = _input.Text.Trim();
+                if (name.Length == 0)
+                    return;
+                if (!_apps.Contains(name))
+                {
+                    _apps.Add(name);
+                    _list.Items.Add(name, true);
+                    _list.SelectedIndex = _list.Items.Count - 1;
+                }
+                _input.Clear();
+            };
+            Controls.Add(addBtn);
+
+            var removeBtn = new Button { Text = "移除选中", Left = 14, Top = 398, Width = 100 };
+            removeBtn.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            removeBtn.Click += delegate
+            {
+                int idx = _list.SelectedIndex;
+                if (idx < 0)
+                    return;
+                _apps.RemoveAt(idx);
+                _list.Items.RemoveAt(idx);
+            };
+            Controls.Add(removeBtn);
+
+            var okBtn = new Button { Text = "确定", Left = 280, Top = 398, Width = 72, DialogResult = DialogResult.OK };
+            okBtn.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+            var cancelBtn = new Button { Text = "取消", Left = 362, Top = 398, Width = 72, DialogResult = DialogResult.Cancel };
+            cancelBtn.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+            Controls.Add(okBtn);
+            Controls.Add(cancelBtn);
+
+            foreach (var a in _apps)
+                _list.Items.Add(a, true);
+
+            AcceptButton = okBtn;
+            CancelButton = cancelBtn;
+            UiStyles.ApplyControls(this);
+        }
+
+        /// <summary>返回当前勾选的应用列表。</summary>
+        public List<string> GetAppNames()
+        {
+            var result = new List<string>();
+            for (int i = 0; i < _list.Items.Count; i++)
+            {
+                if (_list.GetItemChecked(i))
+                    result.Add(_list.Items[i].ToString());
+            }
+            return result;
+        }
+    }
+
+    /// <summary>单行文本输入对话框，用于添加应用名。</summary>
+    class AppProxyEditForm : Form
+    {
+        TextBox _box;
+
+        AppProxyEditForm(string title, string value)
+        {
+            Text = title;
+            UiStyles.ApplyForm(this);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MinimizeBox = false;
+            MaximizeBox = false;
+            ShowInTaskbar = false;
+            Width = 420;
+            Height = 150;
+
+            var label = new Label { Left = 14, Top = 16, Width = 380, Text = "进程名（例如 game.exe）" };
+            _box = new TextBox { Left = 14, Top = 40, Width = 380, Text = value };
+
+            var okBtn = new Button { Text = "确定", Left = 240, Top = 76, Width = 72, DialogResult = DialogResult.OK };
+            var cancelBtn = new Button { Text = "取消", Left = 322, Top = 76, Width = 72, DialogResult = DialogResult.Cancel };
+
+            Controls.Add(label);
+            Controls.Add(_box);
+            Controls.Add(okBtn);
+            Controls.Add(cancelBtn);
+
+            AcceptButton = okBtn;
+            CancelButton = cancelBtn;
+            UiStyles.ApplyControls(this);
+        }
+
+        public static string Prompt(IWin32Window owner, string title, string value)
+        {
+            using (var dlg = new AppProxyEditForm(title, value))
+            {
+                if (dlg.ShowDialog(owner) != DialogResult.OK)
+                    return null;
+                return dlg._box.Text.Trim();
+            }
+        }
     }
 
     class PanelSettingsForm : Form
