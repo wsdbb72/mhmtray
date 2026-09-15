@@ -167,10 +167,43 @@ for s, desc in [
     check(s, (s in blob) or (s in u8), desc)
 print()
 
+# ── 本轮（第二轮修复）新增内容 ──
+print('--- 2b. 本轮新增符号 ---')
+for s, desc in [
+    ('IsLoopbackEndpointReachable', 'API 调用前的廉价 TCP 闸门（消除 2 秒阻塞）'),
+    ('StopProxiFyreService', 'ProxiFyre 停止服务实现'),
+    ('OnToggleProxiFyreService', 'ProxiFyre 启停开关回调'),
+    ('ResolveDataDirectory', '数据目录解析（支持单文件运行）'),
+    ('EnsureDataDirectoryInitialized', '首次运行初始化'),
+    ('_snapshotMode', '模式纳入快照（菜单不再同步发 HTTP）'),
+    ('_snapshotAutoStart', '开机自启纳入快照'),
+    ('_appProxyServiceItem', 'ProxiFyre 总开关菜单项'),
+    ('_firstRunMissingCore', '缺核心状态标记'),
+]:
+    check(s, (s in u8) or (s in blob), desc)
+print()
+
+print('--- 2c. 本轮新增 UI 文案 ---')
+for s, desc in [
+    ('关闭 ProxiFyre（停止服务）', 'ProxiFyre 关闭选项（用户反馈缺失的功能）'),
+    ('启动 ProxiFyre 服务', 'ProxiFyre 启动选项'),
+    ('（需管理员）', '非管理员提示'),
+    ('ProxiFyre 已关闭 · 按应用代理已失效，流量回归默认路由', '关闭成功提示'),
+    ('启动 Mihomo（缺少核心 mihomo.exe）', '首次运行缺核心的明确提示'),
+    ('# Mihomo 配置（由 MihomoTray 首次运行自动生成）', '单文件首次运行的骨架配置头'),
+]:
+    check(s, (s in blob) or (s in u8), desc)
+print()
+
 print('--- 3. 旧符号已移除 ---')
 check('RefreshAppProxyMenu 已删除',
       not (('RefreshAppProxyMenu' in u8) or ('RefreshAppProxyMenu' in blob)),
       '消除重复同步实现')
+# 关键回归：菜单渲染路径不得再直接调 ResolveCurrentMode
+# （它是 2 秒阻塞的来源；现在只允许出现在 CaptureSnapshot 里）
+_n = blob.count('ResolveCurrentMode') + u8.count('ResolveCurrentMode')
+check('ResolveCurrentMode 仍有定义（供快照线程使用）', _n > 0,
+      '出现 %d 次' % _n)
 print()
 
 print('--- 4. 四个图标 Base64 完整嵌入 ---')
