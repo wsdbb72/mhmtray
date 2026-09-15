@@ -7897,7 +7897,13 @@ namespace MihomoTray
             var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var seenUrls = new HashSet<string>(StringComparer.Ordinal);
 
-            IWin32Window owner = hostMode ? (IWin32Window)this.ParentForm : this;
+            // 提示框宿主：嵌入式场景下 this 是挂在 TabPage 里的无边框控件，
+            // 直接把它当 Owner 会让提示框层级错乱，因此改用 ParentForm。
+            // ParentForm 可能为 null（理论上不会，但不值得为此崩掉），
+            // 此时退回 this —— MessageBox 接受 null owner。
+            IWin32Window owner = this;
+            if (hostMode && this.ParentForm != null)
+                owner = this.ParentForm;
 
             for (int i = 0; i < _items.Count; i++)
             {
