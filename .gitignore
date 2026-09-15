@@ -22,3 +22,5 @@ mihomo/
 
 mihomo-tray/*.exe
 mihomo-tray/*.7z
+
+.workbuddy-ai/

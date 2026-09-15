@@ -93,6 +93,10 @@ namespace MihomoTray
         bool _loadedLastTunEnabled;
         bool _loadedSystemProxyDesired;
         bool _isUpdatingAssets;
+        /// <summary>订阅更新进行中（用于串行化并禁用菜单项）。</summary>
+        bool _isUpdatingSubscription;
+        /// <summary>由订阅更新触发的核心重启，抑制重复的启动/停止气泡。</summary>
+        bool _suppressMihomoBalloon;
         bool _cachedSystemProxyReadOk;
         bool _cachedSystemProxyEnabled;
         string _cachedSystemProxyServer;
@@ -688,6 +692,11 @@ namespace MihomoTray
 
         // ──── Refresh UI ────
 
+        /// <summary>
+        /// 重建「更新订阅」子菜单。
+        /// 每个订阅是一个二级菜单：点开后可分别「更新」或「应用为当前配置」，
+        /// 避免原先「点名字=更新」把两个不同语义的动作混在一个入口上。
+        /// </summary>
         void RefreshSubscriptions()
         {
             _subMenu.DropDownItems.Clear();
@@ -699,24 +708,160 @@ namespace MihomoTray
                 empty.Enabled = false;
                 empty.Image = UiStyles.MenuIcon("empty", false);
                 _subMenu.DropDownItems.Add(empty);
+
+                var addHint = new ToolStripMenuItem("添加订阅…", null, OnSubscriptionManager);
+                addHint.Image = UiStyles.MenuIcon("plus", false);
+                _subMenu.DropDownItems.Add(addHint);
             }
             else
             {
                 foreach (var sub in subs)
                 {
-                    var subRef = sub;
-                    var item = new ToolStripMenuItem(sub.Name, null,
+                    SubscriptionInfo subRef = sub;
+
+                    var parent = new ToolStripMenuItem(
+                        BuildSubscriptionLabel(subRef),
+                        UiStyles.MenuIcon("refresh", false));
+
+                    var updateOne = new ToolStripMenuItem("更新此订阅", null,
                         delegate { OnUpdateSubscription(subRef); });
-                    item.Image = UiStyles.MenuIcon("refresh", false);
-                    _subMenu.DropDownItems.Add(item);
+                    updateOne.Image = UiStyles.MenuIcon("refresh", false);
+                    parent.DropDownItems.Add(updateOne);
+
+                    var switchOne = new ToolStripMenuItem("应用为当前配置", null,
+                        delegate { OnApplySubscription(subRef); });
+                    switchOne.Image = UiStyles.MenuIcon("profile", false);
+                    parent.DropDownItems.Add(switchOne);
+
+                    var copyUrl = new ToolStripMenuItem("复制订阅链接", null,
+                        delegate { CopySubscriptionUrl(subRef); });
+                    copyUrl.Image = UiStyles.MenuIcon("list", false);
+                    parent.DropDownItems.Add(copyUrl);
+
+                    _subMenu.DropDownItems.Add(parent);
                 }
+
                 _subMenu.DropDownItems.Add(new ToolStripSeparator());
-                var updateAll = new ToolStripMenuItem("更新全部", null, OnUpdateAllSubscriptions);
+
+                var updateAll = new ToolStripMenuItem("更新全部订阅", null, OnUpdateAllSubscriptions);
                 updateAll.Image = UiStyles.MenuIcon("download", false);
                 _subMenu.DropDownItems.Add(updateAll);
+
+                var manage = new ToolStripMenuItem("订阅管理…", null, OnSubscriptionManager);
+                manage.Image = UiStyles.MenuIcon("list", false);
+                _subMenu.DropDownItems.Add(manage);
             }
 
             UiStyles.ApplyMenuItems(_subMenu.DropDown);
+        }
+
+        /// <summary>订阅菜单项标题：名称 + 主机名，便于区分同名的不同机场。</summary>
+        static string BuildSubscriptionLabel(SubscriptionInfo sub)
+        {
+            string name = string.IsNullOrEmpty(sub.Name) ? "(未命名)" : sub.Name;
+            string host = ExtractUrlHost(sub.Url);
+            if (host.Length == 0)
+                return name;
+            return name + "  —  " + host;
+        }
+
+        static string ExtractUrlHost(string url)
+        {
+            if (string.IsNullOrEmpty(url))
+                return "";
+            try
+            {
+                var m = Regex.Match(url, @"^[a-zA-Z][a-zA-Z0-9+.\-]*://([^/?#]+)");
+                if (!m.Success)
+                    return "";
+                string hostPort = m.Groups[1].Value;
+                // 去掉 user:pass@ 前缀
+                int at = hostPort.LastIndexOf('@');
+                if (at >= 0)
+                    hostPort = hostPort.Substring(at + 1);
+                return hostPort;
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        void CopySubscriptionUrl(SubscriptionInfo sub)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(sub.Url))
+                {
+                    _trayIcon.ShowBalloonTip(2000, "Mihomo", "该订阅没有链接", ToolTipIcon.Warning);
+                    return;
+                }
+                Clipboard.SetText(sub.Url);
+                _trayIcon.ShowBalloonTip(1500, "Mihomo", "订阅链接已复制到剪贴板", ToolTipIcon.Info);
+            }
+            catch (Exception ex)
+            {
+                _trayIcon.ShowBalloonTip(2000, "Mihomo", "复制失败: " + ex.Message, ToolTipIcon.Error);
+            }
+        }
+
+        /// <summary>
+        /// 把订阅的 proxies 应用到当前活动配置。
+        /// 这是「切换」语义：只替换节点，保留活动配置中的端口/规则等本地设置。
+        /// </summary>
+        void OnApplySubscription(SubscriptionInfo sub)
+        {
+            if (_isUpdatingSubscription)
+            {
+                _trayIcon.ShowBalloonTip(2000, "Mihomo", "订阅更新正在进行中，请稍候", ToolTipIcon.Info);
+                return;
+            }
+
+            _isUpdatingSubscription = true;
+            if (_subMgrItem != null) _subMgrItem.Enabled = false;
+            if (_subMenu != null) _subMenu.Enabled = false;
+
+            var self = this;
+            new Thread((ThreadStart)delegate
+            {
+                string error = null;
+                bool success = false;
+                try
+                {
+                    success = DownloadAndMergeSubscription(sub.Url, sub.Name, out error);
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                }
+
+                self.BeginInvoke(new Action(delegate
+                {
+                    try
+                    {
+                        if (success)
+                        {
+                            RestartMihomoQuietly();
+                            _trayIcon.ShowBalloonTip(2500, "Mihomo",
+                                "已应用订阅 [" + sub.Name + "] 的节点", ToolTipIcon.Info);
+                        }
+                        else
+                        {
+                            _trayIcon.ShowBalloonTip(4000, "Mihomo",
+                                "应用订阅 [" + sub.Name + "] 失败："
+                                + (error == null ? "未知错误" : error),
+                                ToolTipIcon.Error);
+                        }
+                    }
+                    finally
+                    {
+                        _isUpdatingSubscription = false;
+                        if (_subMgrItem != null) _subMgrItem.Enabled = true;
+                        if (_subMenu != null) _subMenu.Enabled = true;
+                        RefreshUI();
+                    }
+                }));
+            }).Start();
         }
 
         void RefreshUI()
@@ -2555,65 +2700,148 @@ namespace MihomoTray
             RestartAsAdmin();
         }
 
+        /// <summary>
+        /// 更新单个订阅。
+        /// 关键约束：并发更新会同时写同一个活动配置并争抢核心重启，因此用标志位串行化；
+        /// 且「全部更新」必须只重启一次核心，而不是每个订阅各重启一次。
+        /// </summary>
         void OnUpdateSubscription(SubscriptionInfo sub)
         {
-            var subRef = sub;
-            var self = this;
-            new System.Threading.Thread((System.Threading.ThreadStart)delegate
-            {
-                try
-                {
-                    self.BeginInvoke(new Action(delegate
-                    {
-                        _trayIcon.ShowBalloonTip(1000, "Mihomo",
-                            "正在更新订阅: " + subRef.Name + " ...",
-                            ToolTipIcon.Info);
-                    }));
-
-                    bool success = DownloadAndMergeSubscription(subRef.Url, subRef.Name);
-
-                    self.BeginInvoke(new Action(delegate
-                    {
-                        if (success)
-                        {
-                            _trayIcon.ShowBalloonTip(2000, "Mihomo",
-                                "订阅 [" + subRef.Name + "] 更新成功，正在重启...",
-                                ToolTipIcon.Info);
-
-                            if (IsMihomoRunning())
-                            {
-                                StopMihomo();
-                                System.Threading.Thread.Sleep(500);
-                                StartMihomo();
-                            }
-                        }
-                        else
-                        {
-                            _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                                "订阅 [" + subRef.Name + "] 更新失败",
-                                ToolTipIcon.Error);
-                        }
-                        RefreshUI();
-                    }));
-                }
-                catch (Exception ex)
-                {
-                    self.BeginInvoke(new Action(delegate
-                    {
-                        _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                            "订阅更新出错: " + ex.Message,
-                            ToolTipIcon.Error);
-                    }));
-                }
-            }).Start();
+            UpdateSubscriptions(new List<SubscriptionInfo> { sub });
         }
 
         void OnUpdateAllSubscriptions(object sender, EventArgs e)
         {
-            var subs = LoadSubscriptions();
-            foreach (var sub in subs)
+            var list = LoadSubscriptions();
+            if (list.Count == 0)
             {
-                OnUpdateSubscription(sub);
+                _trayIcon.ShowBalloonTip(2000, "Mihomo", "没有可更新的订阅", ToolTipIcon.Warning);
+                return;
+            }
+            UpdateSubscriptions(list);
+        }
+
+        /// <summary>
+        /// 顺序更新一批订阅，结束后统一重启一次核心。
+        /// 串行而非并行：多个订阅会合并进同一个活动配置，并行写必然互相覆盖。
+        /// </summary>
+        void UpdateSubscriptions(List<SubscriptionInfo> list)
+        {
+            if (_isUpdatingSubscription)
+            {
+                _trayIcon.ShowBalloonTip(2000, "Mihomo", "订阅更新正在进行中，请稍候", ToolTipIcon.Info);
+                return;
+            }
+            if (list == null || list.Count == 0)
+                return;
+
+            _isUpdatingSubscription = true;
+            if (_subMgrItem != null) _subMgrItem.Enabled = false;
+            if (_subMenu != null) _subMenu.Enabled = false;
+
+            var self = this;
+            new Thread((ThreadStart)delegate
+            {
+                var ok = new List<string>();
+                var failed = new List<string>();
+                string lastError = null;
+
+                for (int i = 0; i < list.Count; i++)
+                {
+                    SubscriptionInfo subRef = list[i];
+                    int seq = i + 1;
+                    int total = list.Count;
+
+                    try
+                    {
+                        self.BeginInvoke(new Action(delegate
+                        {
+                            _trayIcon.ShowBalloonTip(1000, "Mihomo",
+                                total > 1
+                                    ? string.Format("正在更新订阅 ({0}/{1}): {2}", seq, total, subRef.Name)
+                                    : "正在更新订阅: " + subRef.Name + " ...",
+                                ToolTipIcon.Info);
+                        }));
+
+                        string error;
+                        if (DownloadAndMergeSubscription(subRef.Url, subRef.Name, out error))
+                            ok.Add(subRef.Name);
+                        else
+                        {
+                            failed.Add(subRef.Name);
+                            lastError = error;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        failed.Add(subRef.Name);
+                        lastError = ex.Message;
+                    }
+                }
+
+                self.BeginInvoke(new Action(delegate
+                {
+                    try
+                    {
+                        // 只要有一个订阅成功，就要让核心重新加载合并后的配置
+                        if (ok.Count > 0)
+                        {
+                            RestartMihomoQuietly();
+                        }
+
+                        if (failed.Count == 0)
+                        {
+                            _trayIcon.ShowBalloonTip(2500, "Mihomo",
+                                ok.Count == 1
+                                    ? "订阅 [" + ok[0] + "] 更新成功"
+                                    : string.Format("{0} 个订阅全部更新成功", ok.Count),
+                                ToolTipIcon.Info);
+                        }
+                        else if (ok.Count == 0)
+                        {
+                            _trayIcon.ShowBalloonTip(4000, "Mihomo",
+                                failed.Count == 1
+                                    ? "订阅 [" + failed[0] + "] 更新失败："
+                                      + (lastError == null ? "未知错误" : lastError)
+                                    : string.Format("{0} 个订阅全部更新失败：{1}", failed.Count,
+                                        lastError == null ? "未知错误" : lastError),
+                                ToolTipIcon.Error);
+                        }
+                        else
+                        {
+                            _trayIcon.ShowBalloonTip(4000, "Mihomo",
+                                string.Format("更新完成：成功 {0} 个，失败 {1} 个（{2}）",
+                                    ok.Count, failed.Count, string.Join("、", failed.ToArray())),
+                                ToolTipIcon.Warning);
+                        }
+                    }
+                    finally
+                    {
+                        _isUpdatingSubscription = false;
+                        if (_subMgrItem != null) _subMgrItem.Enabled = true;
+                        if (_subMenu != null) _subMenu.Enabled = true;
+                        RefreshUI();
+                    }
+                }));
+            }).Start();
+        }
+
+        /// <summary>静默重启核心（保留「原本是否在运行」的语义，不弹启动提示）。</summary>
+        void RestartMihomoQuietly()
+        {
+            try
+            {
+                if (!IsMihomoRunning())
+                    return;
+                _suppressMihomoBalloon = true;
+                StopMihomo();
+                Thread.Sleep(500);
+                StartMihomo();
+            }
+            catch { }
+            finally
+            {
+                _suppressMihomoBalloon = false;
             }
         }
 
@@ -2690,7 +2918,8 @@ namespace MihomoTray
                 string msg = "已启动";
                 if (tunOn) msg += " (TUN 模式)";
                 if (needElevation) msg += "\n已通过管理员权限启动";
-                _trayIcon.ShowBalloonTip(2000, "Mihomo", msg, ToolTipIcon.Info);
+                if (!_suppressMihomoBalloon)
+                    _trayIcon.ShowBalloonTip(2000, "Mihomo", msg, ToolTipIcon.Info);
 
                 RefreshUI();
             }
@@ -2715,7 +2944,8 @@ namespace MihomoTray
                 string details;
                 if (StopManagedMihomoProcesses(MihomoStopTimeoutMilliseconds, out details))
                 {
-                    _trayIcon.ShowBalloonTip(2000, "Mihomo", "已停止", ToolTipIcon.Info);
+                    if (!_suppressMihomoBalloon)
+                        _trayIcon.ShowBalloonTip(2000, "Mihomo", "已停止", ToolTipIcon.Info);
                 }
                 else
                 {
@@ -3176,7 +3406,7 @@ namespace MihomoTray
                 sb.Append("{\r\n  \"appNames\": [\r\n");
                 for (int i = 0; i < names.Count; i++)
                 {
-                    sb.Append("    \"").Append(EscapeJson(names[i])).Append("\"");
+                    sb.Append("    \"").Append(EscapeJsonString(names[i])).Append("\"");
                     if (i < names.Count - 1) sb.Append(",");
                     sb.Append("\r\n");
                 }
@@ -3369,7 +3599,7 @@ namespace MihomoTray
 
                 var sb = new StringBuilder();
                 sb.Append("{\r\n");
-                sb.Append("  \"logLevel\": \"").Append(EscapeJson(logLevel)).Append("\",\r\n");
+                sb.Append("  \"logLevel\": \"").Append(EscapeJsonString(logLevel)).Append("\",\r\n");
                 sb.Append("  \"bypassLan\": ").Append(bypassLan ? "true" : "false").Append(",\r\n");
                 sb.Append("  \"proxies\": [\r\n");
                 for (int g = 0; g < result.Count; g++)
@@ -3378,12 +3608,12 @@ namespace MihomoTray
                     sb.Append("      \"appNames\": [\r\n");
                     for (int i = 0; i < result[g].Count; i++)
                     {
-                        sb.Append("        \"").Append(EscapeJson(result[g][i])).Append("\"");
+                        sb.Append("        \"").Append(EscapeJsonString(result[g][i])).Append("\"");
                         if (i < result[g].Count - 1) sb.Append(",");
                         sb.Append("\r\n");
                     }
                     sb.Append("      ],\r\n");
-                    sb.Append("      \"socks5ProxyEndpoint\": \"").Append(EscapeJson(endpoint)).Append("\",\r\n");
+                    sb.Append("      \"socks5ProxyEndpoint\": \"").Append(EscapeJsonString(endpoint)).Append("\",\r\n");
                     sb.Append("      \"username\": \"\",\r\n");
                     sb.Append("      \"password\": \"\",\r\n");
                     sb.Append("      \"socks5Transport\": \"TCP\",\r\n");
@@ -3740,8 +3970,21 @@ namespace MihomoTray
             return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
-        bool DownloadAndMergeSubscription(string url, string name)
+        /// <summary>
+        /// 下载订阅并合并其 proxies 到活动配置。
+        /// 不再直接弹气球：错误通过 error 回传，由调用方汇总后一次性提示，
+        /// 避免「更新全部」时弹出十几个提示框互相覆盖。
+        /// </summary>
+        bool DownloadAndMergeSubscription(string url, string name, out string error)
         {
+            error = null;
+
+            if (string.IsNullOrEmpty(url) || url.Trim().Length == 0)
+            {
+                error = "订阅链接为空";
+                return false;
+            }
+
             string downloadedYaml;
             try
             {
@@ -3749,65 +3992,70 @@ namespace MihomoTray
             }
             catch (Exception ex)
             {
-                this.BeginInvoke(new Action(delegate
-                {
-                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                        "下载订阅 [" + name + "] 失败: " + ex.Message,
-                        ToolTipIcon.Error);
-                }));
+                error = "下载失败: " + ex.Message;
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(downloadedYaml))
+            {
+                error = "返回内容为空";
+                return false;
+            }
+
+            // 部分机场会对失效订阅返回一句错误说明而不是配置
+            string head = downloadedYaml.TrimStart();
+            if (head.Length > 0 && head[0] == '{')
+            {
+                error = "返回的是 JSON 而非配置，订阅可能已失效";
+                return false;
+            }
+            if (head.StartsWith("<", StringComparison.Ordinal))
+            {
+                error = "返回的是网页而非配置（链接可能已过期或需要登录）";
                 return false;
             }
 
             if (IsBase64String(downloadedYaml))
             {
+                string decoded = null;
                 try
                 {
-                    downloadedYaml = Encoding.UTF8.GetString(
-                        Convert.FromBase64String(downloadedYaml));
+                    decoded = Encoding.UTF8.GetString(Convert.FromBase64String(downloadedYaml));
                 }
                 catch
                 {
                     try
                     {
-                        downloadedYaml = Encoding.UTF8.GetString(
-                            Convert.FromBase64String(
-                                downloadedYaml.Trim().Replace(" ", "+")));
+                        decoded = Encoding.UTF8.GetString(
+                            Convert.FromBase64String(downloadedYaml.Trim().Replace(" ", "+")));
                     }
-                    catch { }
-                }
-            }
-
-            if (string.IsNullOrWhiteSpace(downloadedYaml))
-                return false;
-
-            return MergeConfig(downloadedYaml, name);
-        }
-
-        bool MergeConfig(string downloadedYaml, string name)
-        {
-            try
-            {
-                if (!File.Exists(_configPath))
-                {
-                    this.BeginInvoke(new Action(delegate
+                    catch
                     {
-                        _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                            "config.yaml 不存在",
-                            ToolTipIcon.Error);
-                    }));
+                        decoded = null;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(decoded))
+                {
+                    error = "Base64 解码失败";
                     return false;
                 }
+                downloadedYaml = decoded;
+            }
 
+            return MergeConfig(downloadedYaml, name, out error);
+        }
+
+        bool MergeConfig(string downloadedYaml, string name, out string error)
+        {
+            error = null;
+            try
+            {
                 string activePath = _activeConfigPath;
                 if (!File.Exists(activePath)) activePath = _configPath;
                 if (!File.Exists(activePath))
                 {
-                    this.BeginInvoke(new Action(delegate
-                    {
-                        _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                            "当前活动配置不存在",
-                            ToolTipIcon.Error);
-                    }));
+                    error = "活动配置不存在: " + activePath;
                     return false;
                 }
 
@@ -3817,24 +4065,14 @@ namespace MihomoTray
 
                 if (string.IsNullOrWhiteSpace(subscriptionProxiesPart))
                 {
-                    this.BeginInvoke(new Action(delegate
-                    {
-                        _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                            "订阅 [" + name + "] 中未找到 proxies 配置",
-                            ToolTipIcon.Error);
-                    }));
+                    error = "订阅中未找到 proxies 配置";
                     return false;
                 }
 
                 int proxiesIndex = FindTopLevelKeyIndex(originalConfig, "proxies:");
                 if (proxiesIndex < 0)
                 {
-                    this.BeginInvoke(new Action(delegate
-                    {
-                        _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                            "config.yaml 中未找到 proxies 配置",
-                            ToolTipIcon.Error);
-                    }));
+                    error = "活动配置中未找到 proxies 配置";
                     return false;
                 }
 
@@ -3847,12 +4085,7 @@ namespace MihomoTray
             }
             catch (Exception ex)
             {
-                this.BeginInvoke(new Action(delegate
-                {
-                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                        "合并配置失败: " + ex.Message,
-                        ToolTipIcon.Error);
-                }));
+                error = "合并配置失败: " + ex.Message;
                 return false;
             }
         }
@@ -3878,41 +4111,184 @@ namespace MihomoTray
 
 		List<SubscriptionInfo> subs = new List<SubscriptionInfo>();
 
+		/// <summary>
+		/// 读取订阅列表。
+		/// 解析使用「提取 JSON 数组正文 + 逐对象扫描」而非单条正则：
+		/// 正则 [^}]* 遇到含 } 的链接、或 name/url 顺序颠倒、含转义引号时都会失配，
+		/// 导致订阅静默丢失或被截断。
+		/// </summary>
 		List<SubscriptionInfo> LoadSubscriptions()
         {
+            return ReadSubscriptionsFromJson(ReadTrayConfigJson());
+        }
+
+        List<SubscriptionInfo> ReadSubscriptionsFromJson(string json)
+        {
             var list = new List<SubscriptionInfo>();
+            string inner = ExtractJsonArrayBody(json, "subscriptions");
+            if (inner == null)
+                return list;
+
+            foreach (string obj in SplitTopLevelObjects(inner))
+            {
+                string name = ExtractObjectString(obj, "name");
+                string url = ExtractObjectString(obj, "url");
+                if (name == null && url == null)
+                    continue;
+                list.Add(new SubscriptionInfo
+                {
+                    Name = name == null ? "" : name,
+                    Url = url == null ? "" : url
+                });
+            }
+            return list;
+        }
+
+        string ReadTrayConfigJson()
+        {
             try
             {
                 if (!File.Exists(_trayConfigPath))
-                {
                     SaveDefaultSubscriptions();
-                }
+                return File.ReadAllText(_trayConfigPath, Encoding.UTF8);
+            }
+            catch
+            {
+                return null;
+            }
+        }
 
-                string json = File.ReadAllText(_trayConfigPath, Encoding.UTF8);
+        /// <summary>
+        /// 取出顶层 "key": [ ... ] 中括号内的正文，能正确跨过字符串与嵌套括号。
+        /// </summary>
+        static string ExtractJsonArrayBody(string json, string key)
+        {
+            if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key))
+                return null;
 
-                var subMatches = Regex.Matches(json,
-                    @"""subscriptions""\s*:\s*\[(.*?)\]",
-                    RegexOptions.Singleline);
+            int keyIdx = json.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
+            if (keyIdx < 0)
+                return null;
 
-                if (subMatches.Count > 0)
+            int i = json.IndexOf(':', keyIdx + key.Length + 2);
+            if (i < 0)
+                return null;
+            i++;
+
+            while (i < json.Length && char.IsWhiteSpace(json[i]))
+                i++;
+            if (i >= json.Length || json[i] != '[')
+                return null;
+
+            int start = i + 1;
+            int depth = 1;
+            bool inString = false;
+            bool escaped = false;
+
+            for (i = start; i < json.Length; i++)
+            {
+                char c = json[i];
+                if (inString)
                 {
-                    string inner = subMatches[0].Groups[1].Value;
-                    var entries = Regex.Matches(inner,
-                        @"{[^}]*""name""\s*:\s*""([^""]+)""[^}]*""url""\s*:\s*""([^""]+)""[^}]*}");
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') inString = false;
+                    continue;
+                }
+                if (c == '"') { inString = true; continue; }
+                if (c == '[') depth++;
+                else if (c == ']')
+                {
+                    depth--;
+                    if (depth == 0)
+                        return json.Substring(start, i - start);
+                }
+            }
+            return null;
+        }
 
-                    foreach (Match entry in entries)
+        /// <summary>把数组正文按顶层 { } 切分为若干对象字面量。</summary>
+        static List<string> SplitTopLevelObjects(string body)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrEmpty(body))
+                return result;
+
+            int depth = 0;
+            int start = -1;
+            bool inString = false;
+            bool escaped = false;
+
+            for (int i = 0; i < body.Length; i++)
+            {
+                char c = body[i];
+                if (inString)
+                {
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') inString = false;
+                    continue;
+                }
+                if (c == '"') { inString = true; continue; }
+
+                if (c == '{')
+                {
+                    if (depth == 0) start = i;
+                    depth++;
+                }
+                else if (c == '}')
+                {
+                    depth--;
+                    if (depth == 0 && start >= 0)
                     {
-                        list.Add(new SubscriptionInfo
-                        {
-                            Name = entry.Groups[1].Value,
-                            Url = entry.Groups[2].Value
-                        });
+                        result.Add(body.Substring(start, i - start + 1));
+                        start = -1;
                     }
                 }
             }
-            catch { }
-            return list;
+            return result;
         }
+
+        /// <summary>从单个对象字面量中取字符串字段；无该字段返回 null，字段为空串返回 ""。</summary>
+        static string ExtractObjectString(string obj, string field)
+        {
+            if (string.IsNullOrEmpty(obj))
+                return null;
+
+            string needle = "\"" + field + "\"";
+            int idx = obj.IndexOf(needle, StringComparison.Ordinal);
+            if (idx < 0)
+                return null;
+
+            int i = obj.IndexOf(':', idx + needle.Length);
+            if (i < 0)
+                return null;
+            i++;
+
+            while (i < obj.Length && char.IsWhiteSpace(obj[i]))
+                i++;
+            if (i >= obj.Length || obj[i] != '"')
+                return null;
+
+            i++;
+            var sb = new StringBuilder();
+            bool escaped = false;
+            for (; i < obj.Length; i++)
+            {
+                char c = obj[i];
+                if (escaped)
+                {
+                    sb.Append('\\').Append(c);
+                    escaped = false;
+                    continue;
+                }
+                if (c == '\\') { escaped = true; continue; }
+                if (c == '"') break;
+                sb.Append(c);
+            }
+            return UnescapeJsonString(sb.ToString());
+        }
+
 
         void SaveDefaultSubscriptions()
         {
@@ -4049,29 +4425,7 @@ namespace MihomoTray
                     }
                 }
 
-				var subsMatch = Regex.Matches(json,
-					@"""subscriptions""\s*:\s*\[(.*?)\]",
-					RegexOptions.Singleline);
-
-				var loaded = new List<SubscriptionInfo>();
-
-				if (subsMatch.Count > 0)
-				{
-					string inner = subsMatch[0].Groups[1].Value;
-					var entries = Regex.Matches(inner,
-						@"{[^}]*""name""\s*:\s*""([^""]+)""[^}]*""url""\s*:\s*""([^""]+)""[^}]*}");
-
-					foreach (Match entry in entries)
-					{
-						loaded.Add(new SubscriptionInfo
-						{
-							Name = entry.Groups[1].Value,
-							Url = entry.Groups[2].Value
-						});
-					}
-				}
-
-				subs = loaded;
+				subs = ReadSubscriptionsFromJson(json);
 			}
 			catch { }
 		}
@@ -4081,23 +4435,23 @@ namespace MihomoTray
             var sb = new StringBuilder();
             sb.Append("{\r\n");
             sb.Append("  \"panel\": {\r\n");
-            sb.Append("    \"host\": \"").Append(EscapeJson(_panelHost)).Append("\",\r\n");
+            sb.Append("    \"host\": \"").Append(EscapeJsonString(_panelHost)).Append("\",\r\n");
             sb.Append("    \"port\": ").Append(_panelPort).Append(",\r\n");
-            sb.Append("    \"path\": \"").Append(EscapeJson(_panelPath)).Append("\"\r\n");
+            sb.Append("    \"path\": \"").Append(EscapeJsonString(_panelPath)).Append("\"\r\n");
             sb.Append("  },\r\n");
             sb.Append("  \"profiles\": [\r\n");
             for (int i = 0; i < _profiles.Count; i++)
             {
                 var p = _profiles[i];
                 sb.Append("    {\r\n");
-                sb.Append("      \"name\": \"").Append(EscapeJson(p.Name)).Append("\",\r\n");
-                sb.Append("      \"path\": \"").Append(EscapeJson(NormalizeRelativePath(p.Path))).Append("\"\r\n");
+                sb.Append("      \"name\": \"").Append(EscapeJsonString(p.Name)).Append("\",\r\n");
+                sb.Append("      \"path\": \"").Append(EscapeJsonString(NormalizeRelativePath(p.Path))).Append("\"\r\n");
                 sb.Append("    }");
                 if (i < _profiles.Count - 1) sb.Append(",");
                 sb.Append("\r\n");
             }
             sb.Append("  ],\r\n");
-            sb.Append("  \"activeConfigPath\": \"").Append(EscapeJson(NormalizeRelativePath(_activeConfigPath))).Append("\",\r\n");
+            sb.Append("  \"activeConfigPath\": \"").Append(EscapeJsonString(NormalizeRelativePath(_activeConfigPath))).Append("\",\r\n");
             sb.Append("  \"runMihomoOnStartup\": ").Append(_runMihomoOnStartup ? "true" : "false").Append(",\r\n");
             sb.Append("  \"lastTunEnabled\": ").Append(_lastTunEnabled ? "true" : "false").Append(",\r\n");
             sb.Append("  \"lastSystemProxyEnabled\": ").Append(_systemProxyDesired ? "true" : "false").Append(",\r\n");
@@ -4111,8 +4465,8 @@ namespace MihomoTray
             {
                 var s = subs[i];
                 sb.Append("    {\r\n");
-                sb.Append("      \"name\": \"").Append(EscapeJson(s.Name)).Append("\",\r\n");
-                sb.Append("      \"url\": \"").Append(EscapeJson(s.Url)).Append("\"\r\n");
+                sb.Append("      \"name\": \"").Append(EscapeJsonString(s.Name)).Append("\",\r\n");
+                sb.Append("      \"url\": \"").Append(EscapeJsonString(s.Url)).Append("\"\r\n");
                 sb.Append("    }");
                 if (i < subs.Count - 1) sb.Append(",");
                 sb.Append("\r\n");
@@ -4144,7 +4498,7 @@ namespace MihomoTray
 
                     foreach (Match entry in entries)
                     {
-                        string key = Regex.Unescape(entry.Groups["key"].Value);
+                        string key = UnescapeJsonString(entry.Groups["key"].Value);
                         string value = entry.Groups["value"].Value;
                         long size = 0;
                         long.TryParse(ExtractJsonNumber(value, "size"), out size);
@@ -4181,11 +4535,11 @@ namespace MihomoTray
                 {
                     string key = keys[i];
                     AssetVersionInfo info = _assetVersions[key];
-                    sb.Append("    \"").Append(EscapeJson(key)).Append("\": {\r\n");
-                    sb.Append("      \"tagName\": \"").Append(EscapeJson(info.TagName)).Append("\",\r\n");
-                    sb.Append("      \"assetName\": \"").Append(EscapeJson(info.AssetName)).Append("\",\r\n");
-                    sb.Append("      \"updatedAt\": \"").Append(EscapeJson(info.UpdatedAt)).Append("\",\r\n");
-                    sb.Append("      \"digest\": \"").Append(EscapeJson(info.Digest)).Append("\",\r\n");
+                    sb.Append("    \"").Append(EscapeJsonString(key)).Append("\": {\r\n");
+                    sb.Append("      \"tagName\": \"").Append(EscapeJsonString(info.TagName)).Append("\",\r\n");
+                    sb.Append("      \"assetName\": \"").Append(EscapeJsonString(info.AssetName)).Append("\",\r\n");
+                    sb.Append("      \"updatedAt\": \"").Append(EscapeJsonString(info.UpdatedAt)).Append("\",\r\n");
+                    sb.Append("      \"digest\": \"").Append(EscapeJsonString(info.Digest)).Append("\",\r\n");
                     sb.Append("      \"size\": ").Append(info.Size < 0 ? 0 : info.Size).Append("\r\n");
                     sb.Append("    }");
                     if (i < keys.Count - 1)
@@ -4234,12 +4588,6 @@ namespace MihomoTray
             path = path.Trim('/');
             if (path.Length == 0) path = "ui";
             return "http://" + _panelHost + ":" + _panelPort + "/" + path + "/";
-        }
-
-        string EscapeJson(string s)
-        {
-            if (s == null) return "";
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
         }
 
         void WriteUtf8FileAtomic(string path, string content)
@@ -4325,7 +4673,7 @@ namespace MihomoTray
 
         AssetReleaseInfo ParseAssetReleaseInfo(string apiJson, Match downloadMatch, string tagName)
         {
-            string downloadUrl = Regex.Unescape(downloadMatch.Groups[1].Value);
+            string downloadUrl = UnescapeJsonString(downloadMatch.Groups[1].Value);
             int windowStart = Math.Max(0, downloadMatch.Index - 12000);
             string beforeDownloadUrl = apiJson.Substring(windowStart, downloadMatch.Index - windowStart);
 
@@ -4357,7 +4705,99 @@ namespace MihomoTray
             if (!match.Success)
                 return "";
 
-            return Regex.Unescape(match.Groups[1].Value);
+            return UnescapeJsonString(match.Groups[1].Value);
+        }
+
+        /// <summary>
+        /// 还原 JSON 字符串字面量中的转义序列。
+        /// 注意不能使用 Regex.Unescape：它会把 \d \s \w 等非 JSON 转义按正则语义处理，
+        /// 导致订阅链接中的片段被悄悄替换（例如 "https:\/\/x" 之外的 \d 被吃掉）。
+        /// 这里只处理 JSON 规范定义的转义。
+        /// </summary>
+        static string UnescapeJsonString(string s)
+        {
+            if (string.IsNullOrEmpty(s) || s.IndexOf('\\') < 0)
+                return s ?? "";
+
+            var sb = new StringBuilder(s.Length);
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c != '\\' || i + 1 >= s.Length)
+                {
+                    sb.Append(c);
+                    continue;
+                }
+
+                char n = s[++i];
+                switch (n)
+                {
+                    case '"': sb.Append('"'); break;
+                    case '\\': sb.Append('\\'); break;
+                    case '/': sb.Append('/'); break;
+                    case 'b': sb.Append('\b'); break;
+                    case 'f': sb.Append('\f'); break;
+                    case 'n': sb.Append('\n'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'u':
+                        if (i + 4 < s.Length)
+                        {
+                            int code;
+                            if (int.TryParse(s.Substring(i + 1, 4),
+                                    System.Globalization.NumberStyles.HexNumber,
+                                    System.Globalization.CultureInfo.InvariantCulture, out code))
+                            {
+                                sb.Append((char)code);
+                                i += 4;
+                            }
+                            else
+                            {
+                                sb.Append('u');
+                            }
+                        }
+                        else
+                        {
+                            sb.Append('u');
+                        }
+                        break;
+                    default:
+                        // 非法转义：保留原样，避免吞字符
+                        sb.Append('\\').Append(n);
+                        break;
+                }
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>按 JSON 规范转义字符串（含控制字符），与 UnescapeJsonString 互逆。</summary>
+        static string EscapeJsonString(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return "";
+
+            var sb = new StringBuilder(s.Length + 8);
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < ' ')
+                            sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else
+                            sb.Append(c);
+                        break;
+                }
+            }
+            return sb.ToString();
         }
 
         string ExtractLastJsonString(string json, string key)
@@ -4369,7 +4809,7 @@ namespace MihomoTray
             if (matches.Count == 0)
                 return "";
 
-            return Regex.Unescape(matches[matches.Count - 1].Groups[1].Value);
+            return UnescapeJsonString(matches[matches.Count - 1].Groups[1].Value);
         }
 
         string ExtractJsonNumber(string json, string key)
@@ -5510,7 +5950,11 @@ namespace MihomoTray
                 if (control is Button)
                 {
                     Button button = (Button)control;
-                    ApplyButton(button, button.DialogResult == DialogResult.OK || button.Text.IndexOf("开始", StringComparison.OrdinalIgnoreCase) >= 0);
+                    // 危险动作（删除）红色描边；其余 DialogResult=OK 的按钮作为主按钮
+                    bool danger = IsDangerButton(button);
+                    ApplyButton(button, !danger && button.DialogResult == DialogResult.OK);
+                    if (danger)
+                        ApplyDangerButton(button);
                 }
                 else if (control is TextBox)
                 {
@@ -5534,15 +5978,41 @@ namespace MihomoTray
             }
         }
 
+        static bool IsDangerButton(Button button)
+        {
+            if (button == null || button.Text == null)
+                return false;
+            string t = button.Text;
+            return t.IndexOf("删除", StringComparison.Ordinal) >= 0
+                || t.IndexOf("移除", StringComparison.Ordinal) >= 0
+                || t.IndexOf("清空", StringComparison.Ordinal) >= 0;
+        }
+
+        public static void ApplyDangerButton(Button button)
+        {
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderSize = 1;
+            button.FlatAppearance.BorderColor = Danger;
+            button.FlatAppearance.MouseOverBackColor = Color.FromArgb(255, 235, 235);
+            button.BackColor = PanelBack;
+            button.ForeColor = Danger;
+            button.Height = Math.Max(button.Height, 30);
+            button.Cursor = Cursors.Hand;
+        }
+
         public static void ApplyButton(Button button, bool primary)
         {
             button.FlatStyle = FlatStyle.Flat;
             button.FlatAppearance.BorderSize = 1;
             button.FlatAppearance.BorderColor = primary ? Accent : Border;
+            button.FlatAppearance.MouseOverBackColor = primary ? AccentHover : HoverBack;
             button.BackColor = primary ? Accent : PanelBack;
             button.ForeColor = primary ? Color.White : Text;
             button.Height = Math.Max(button.Height, 30);
             button.Cursor = Cursors.Hand;
+            button.UseVisualStyleBackColor = false;
+            // 主按钮加粗，视觉上明确「默认动作」
+            button.Font = primary ? TitleFont : BaseFont;
         }
 
         public static void ApplyTextBox(TextBox box)
@@ -5563,15 +6033,26 @@ namespace MihomoTray
             grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(241, 245, 249);
             grid.ColumnHeadersDefaultCellStyle.ForeColor = Text;
             grid.ColumnHeadersDefaultCellStyle.Font = TitleFont;
-            grid.ColumnHeadersHeight = 32;
+            grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = Color.FromArgb(241, 245, 249);
+            grid.ColumnHeadersDefaultCellStyle.SelectionForeColor = Text;
+            grid.ColumnHeadersDefaultCellStyle.Padding = new Padding(6, 0, 6, 0);
+            grid.ColumnHeadersHeight = 34;
+            grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
             grid.DefaultCellStyle.BackColor = PanelBack;
             grid.DefaultCellStyle.ForeColor = Text;
             grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(219, 234, 254);
             grid.DefaultCellStyle.SelectionForeColor = Text;
-            grid.RowTemplate.Height = 28;
+            grid.DefaultCellStyle.Padding = new Padding(6, 0, 6, 0);
+            grid.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(250, 251, 253);
+            grid.RowTemplate.Height = 30;
             grid.RowHeadersVisible = false;
             grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
             grid.MultiSelect = false;
+            grid.AllowUserToResizeRows = false;
+            grid.ShowCellToolTips = true;
+            // 表头扁平化：去掉默认的 3D 凸起，与菜单/按钮的扁平风格保持一致
+            grid.AdvancedColumnHeadersBorderStyle.All = DataGridViewAdvancedCellBorderStyle.None;
+            grid.AdvancedCellBorderStyle.Top = DataGridViewAdvancedCellBorderStyle.None;
         }
 
         public static void ApplyCheckedList(CheckedListBox list)
@@ -5642,30 +6123,187 @@ namespace MihomoTray
             return path;
         }
 
+        /// <summary>
+        /// 生成菜单图标。
+        /// 原实现对每个 key 都画同一个灰色圆点，等于没有图标信息量——
+        /// 这里为常用项绘制可区分的矢量图形，并统一 18x18 描边风格。
+        /// </summary>
         static Image CreateMenuIcon(string key, bool active)
         {
-            var bmp = new Bitmap(18, 18);
+            const int size = 18;
+            var bmp = new Bitmap(size, size);
             Color fill = active ? ActiveGreen : IconText;
+            Color accent = active ? ActiveGreen : Accent;
+
             if (string.Equals(key, "exit", StringComparison.OrdinalIgnoreCase))
-            {
                 fill = Danger;
-            }
             if (string.Equals(key, "status-on", StringComparison.OrdinalIgnoreCase))
-            {
                 fill = ActiveGreen;
-            }
             if (string.Equals(key, "status-off", StringComparison.OrdinalIgnoreCase))
-            {
                 fill = MutedText;
-            }
 
             using (Graphics g = Graphics.FromImage(bmp))
-            using (SolidBrush brush = new SolidBrush(fill))
+            using (var pen = new Pen(fill, 1.6F))
+            using (var brush = new SolidBrush(fill))
             {
                 g.Clear(Color.Transparent);
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                g.FillEllipse(brush, 5.5F, 5.5F, 7.5F, 7.5F);
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                pen.LineJoin = LineJoin.Round;
+
+                switch ((key ?? "").ToLowerInvariant())
+                {
+                    case "play":                    // 三角形：启动
+                        g.FillPolygon(brush, new[]
+                        {
+                            new PointF(6F, 4F), new PointF(14F, 9F), new PointF(6F, 14F)
+                        });
+                        break;
+
+                    case "stop":                    // 方块：停止
+                        g.FillRectangle(brush, 5.5F, 5.5F, 7F, 7F);
+                        break;
+
+                    case "status-on":               // 实心圆：运行中
+                        g.FillEllipse(brush, 5F, 5F, 8F, 8F);
+                        break;
+
+                    case "status-off":              // 空心圆：已停止
+                        g.DrawEllipse(pen, 5F, 5F, 8F, 8F);
+                        break;
+
+                    case "proxy":                   // 双向箭头：流量转发
+                        g.DrawLine(pen, 3.5F, 6.5F, 13F, 6.5F);
+                        g.DrawLine(pen, 10.5F, 4F, 13F, 6.5F);
+                        g.DrawLine(pen, 10.5F, 9F, 13F, 6.5F);
+                        g.DrawLine(pen, 14.5F, 11.5F, 5F, 11.5F);
+                        g.DrawLine(pen, 7.5F, 9F, 5F, 11.5F);
+                        g.DrawLine(pen, 7.5F, 14F, 5F, 11.5F);
+                        break;
+
+                    case "tun":                     // 网卡板卡 + 引脚：TUN
+                        g.DrawRectangle(pen, 3.5F, 4F, 11F, 8.5F);
+                        g.DrawLine(pen, 6F, 12.5F, 6F, 15F);
+                        g.DrawLine(pen, 9F, 12.5F, 9F, 15F);
+                        g.DrawLine(pen, 12F, 12.5F, 12F, 15F);
+                        break;
+
+                    case "guard":                   // 盾牌：守护
+                        g.DrawLines(pen, new[]
+                        {
+                            new PointF(9F, 3.5F), new PointF(14F, 5.5F), new PointF(14F, 9.5F),
+                            new PointF(9F, 14.5F), new PointF(4F, 9.5F), new PointF(4F, 5.5F),
+                            new PointF(9F, 3.5F)
+                        });
+                        break;
+
+                    case "refresh":                 // 环形箭头：更新
+                        g.DrawArc(pen, 4F, 4F, 10F, 10F, 60F, 250F);
+                        g.FillPolygon(brush, new[]
+                        {
+                            new PointF(9.4F, 3.0F), new PointF(14.1F, 4.4F), new PointF(11.4F, 8.1F)
+                        });
+                        break;
+
+                    case "download":                // 下箭头 + 底座：下载
+                        g.DrawLine(pen, 9F, 3.5F, 9F, 10.5F);
+                        g.DrawLine(pen, 6F, 7.5F, 9F, 10.5F);
+                        g.DrawLine(pen, 12F, 7.5F, 9F, 10.5F);
+                        g.DrawLine(pen, 4F, 13.5F, 14F, 13.5F);
+                        break;
+
+                    case "profile":                 // 文件夹：配置
+                        g.DrawLines(pen, new[]
+                        {
+                            new PointF(3F, 13.5F), new PointF(3F, 5F), new PointF(7.5F, 5F),
+                            new PointF(9F, 7F), new PointF(15F, 7F), new PointF(15F, 13.5F),
+                            new PointF(3F, 13.5F)
+                        });
+                        break;
+
+                    case "list":                    // 列表：三条线
+                        g.DrawLine(pen, 6F, 5F, 14F, 5F);
+                        g.DrawLine(pen, 6F, 9F, 14F, 9F);
+                        g.DrawLine(pen, 6F, 13F, 14F, 13F);
+                        g.FillEllipse(brush, 3.2F, 4.2F, 1.6F, 1.6F);
+                        g.FillEllipse(brush, 3.2F, 8.2F, 1.6F, 1.6F);
+                        g.FillEllipse(brush, 3.2F, 12.2F, 1.6F, 1.6F);
+                        break;
+
+                    case "plus":                    // 加号
+                        g.DrawLine(pen, 9F, 4.5F, 9F, 13.5F);
+                        g.DrawLine(pen, 4.5F, 9F, 13.5F, 9F);
+                        break;
+
+                    case "edit":                    // 铅笔
+                        g.DrawLine(pen, 5F, 13F, 12F, 6F);
+                        g.DrawLine(pen, 10.6F, 4.6F, 13.4F, 7.4F);
+                        g.DrawLine(pen, 4.2F, 13.8F, 5.2F, 12.4F);
+                        break;
+
+                    case "settings":                // 齿轮（简化）：中心圆 + 四点
+                        g.DrawEllipse(pen, 6.5F, 6.5F, 5F, 5F);
+                        g.FillEllipse(brush, 8.2F, 3F, 1.6F, 1.6F);
+                        g.FillEllipse(brush, 8.2F, 13.4F, 1.6F, 1.6F);
+                        g.FillEllipse(brush, 3F, 8.2F, 1.6F, 1.6F);
+                        g.FillEllipse(brush, 13.4F, 8.2F, 1.6F, 1.6F);
+                        break;
+
+                    case "panel":                   // 窗口
+                        g.DrawRectangle(pen, 3.5F, 4.5F, 11F, 9F);
+                        g.DrawLine(pen, 3.5F, 7.5F, 14.5F, 7.5F);
+                        break;
+
+                    case "power":                   // 电源
+                        g.DrawArc(pen, 4F, 4.5F, 10F, 10F, -60F, 300F);
+                        g.DrawLine(pen, 9F, 3F, 9F, 8F);
+                        break;
+
+                    case "startup":                 // 火箭/上箭头：启动项
+                        g.DrawLine(pen, 9F, 14F, 9F, 6F);
+                        g.DrawLine(pen, 6F, 9F, 9F, 6F);
+                        g.DrawLine(pen, 12F, 9F, 9F, 6F);
+                        g.DrawLine(pen, 5F, 15F, 13F, 15F);
+                        break;
+
+                    case "mode":                    // 分叉：规则分流
+                        g.DrawLine(pen, 4.5F, 9F, 8F, 9F);
+                        g.DrawLine(pen, 8F, 9F, 11F, 4.8F);
+                        g.DrawLine(pen, 8F, 9F, 11F, 13.2F);
+                        g.FillEllipse(brush, 3F, 7.8F, 2.4F, 2.4F);
+                        g.FillEllipse(brush, 11.6F, 3.6F, 2.4F, 2.4F);
+                        g.FillEllipse(brush, 11.6F, 12F, 2.4F, 2.4F);
+                        break;
+
+                    case "appproxy":                // 应用方块 + 箭头
+                        g.DrawRectangle(pen, 3.5F, 3.5F, 6F, 6F);
+                        g.DrawLine(pen, 11F, 12.5F, 14.5F, 12.5F);
+                        g.DrawLine(pen, 12.6F, 10.6F, 14.5F, 12.5F);
+                        g.DrawLine(pen, 12.6F, 14.4F, 14.5F, 12.5F);
+                        break;
+
+                    case "app":                     // 应用方块
+                        g.DrawRectangle(pen, 4F, 4F, 10F, 10F);
+                        break;
+
+                    case "empty":                   // 空集
+                        g.DrawEllipse(pen, 4F, 4F, 10F, 10F);
+                        g.DrawLine(pen, 5.2F, 12.8F, 12.8F, 5.2F);
+                        break;
+
+                    case "exit":                    // 门 + 出箭头
+                        g.DrawLine(pen, 11.5F, 3.5F, 11.5F, 14.5F);
+                        g.DrawLine(pen, 4F, 9F, 10F, 9F);
+                        g.DrawLine(pen, 7.5F, 6.5F, 10F, 9F);
+                        g.DrawLine(pen, 7.5F, 11.5F, 10F, 9F);
+                        break;
+
+                    default:                        // 未定义：保持圆点，避免出现空白
+                        g.FillEllipse(brush, 5.5F, 5.5F, 7.5F, 7.5F);
+                        break;
+                }
             }
 
             return bmp;
@@ -5994,11 +6632,18 @@ namespace MihomoTray
         }
     }
 
+    /// <summary>
+    /// 订阅管理。
+    /// 相比原始实现补齐了：重复名称/链接校验、删除确认、主机名与链接脱敏展示、
+    /// 双击编辑、空列表提示。原实现只做增删改移，缺少任何输入校验，
+    /// 容易保存出两条同名订阅或重复链接而无法区分。
+    /// </summary>
     class SubscriptionManagerForm : Form
     {
         DataGridView _grid;
         BindingSource _source;
         List<SubscriptionInfo> _items;
+        Label _hint;
 
         public SubscriptionManagerForm(List<SubscriptionInfo> items)
         {
@@ -6009,90 +6654,147 @@ namespace MihomoTray
             MinimizeBox = false;
             MaximizeBox = false;
             ShowInTaskbar = false;
-            Width = 620;
-            Height = 420;
+            ClientSize = new Size(720, 452);
 
-            _items = items;
+            _items = items == null ? new List<SubscriptionInfo>() : new List<SubscriptionInfo>(items);
             _source = new BindingSource();
             _source.DataSource = _items;
 
+            _hint = new Label();
+            _hint.Left = 14;
+            _hint.Top = 12;
+            _hint.Width = 692;
+            _hint.Height = 18;
+            _hint.Text = "按「更新此订阅」拉取节点并写入当前配置；双击可编辑名称与链接。";
+            _hint.ForeColor = UiStyles.MutedText;
+            Controls.Add(_hint);
+
             _grid = new DataGridView();
-            _grid.Left = 12;
-            _grid.Top = 12;
-            _grid.Width = 580;
-            _grid.Height = 310;
+            _grid.Left = 14;
+            _grid.Top = 36;
+            _grid.Width = 692;
+            _grid.Height = 348;
             _grid.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             _grid.AutoGenerateColumns = false;
             _grid.AllowUserToAddRows = false;
             _grid.AllowUserToDeleteRows = false;
+            _grid.AllowUserToResizeRows = false;
+            _grid.ReadOnly = true;
+            _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            _grid.MultiSelect = false;
+            _grid.RowHeadersVisible = false;
             _grid.DataSource = _source;
 
             var nameCol = new DataGridViewTextBoxColumn();
             nameCol.DataPropertyName = "Name";
             nameCol.HeaderText = "名称";
-            nameCol.Width = 180;
+            nameCol.Width = 200;
+
+            var hostCol = new DataGridViewTextBoxColumn();
+            hostCol.Name = "HostColumn";
+            hostCol.HeaderText = "服务器";
+            hostCol.Width = 200;
 
             var urlCol = new DataGridViewTextBoxColumn();
-            urlCol.DataPropertyName = "Url";
-            urlCol.HeaderText = "订阅链接";
-            urlCol.Width = 380;
+            urlCol.Name = "UrlColumn";
+            urlCol.HeaderText = "订阅链接（已脱敏）";
+            urlCol.Width = 260;
 
             _grid.Columns.Add(nameCol);
+            _grid.Columns.Add(hostCol);
             _grid.Columns.Add(urlCol);
 
-            var addBtn = new Button { Text = "新增", Left = 12, Top = 332, Width = 72 };
-            var editBtn = new Button { Text = "编辑", Left = 92, Top = 332, Width = 72 };
-            var delBtn = new Button { Text = "删除", Left = 172, Top = 332, Width = 72 };
-            var upBtn = new Button { Text = "上移", Left = 252, Top = 332, Width = 72 };
-            var downBtn = new Button { Text = "下移", Left = 332, Top = 332, Width = 72 };
-            var okBtn = new Button { Text = "确定", Left = 440, Top = 332, Width = 72, DialogResult = DialogResult.OK };
-            var cancelBtn = new Button { Text = "取消", Left = 520, Top = 332, Width = 72, DialogResult = DialogResult.Cancel };
+            // 派生列用手工填值：主键仍是 Name/Url，避免引入会随序列化泄漏的额外字段
+            _grid.CellFormatting += delegate(object s, DataGridViewCellFormattingEventArgs ev)
+            {
+                if (ev.RowIndex < 0 || ev.RowIndex >= _items.Count)
+                    return;
+                SubscriptionInfo item = _items[ev.RowIndex];
+                if (_grid.Columns[ev.ColumnIndex].Name == "HostColumn")
+                {
+                    string host = ExtractHostStatic(item.Url);
+                    ev.Value = host.Length == 0 ? "—" : host;
+                    ev.FormattingApplied = true;
+                }
+                else if (_grid.Columns[ev.ColumnIndex].Name == "UrlColumn")
+                {
+                    ev.Value = MaskSubscriptionUrl(item.Url);
+                    ev.FormattingApplied = true;
+                }
+            };
+
+            _grid.CellDoubleClick += delegate(object s, DataGridViewCellEventArgs ev)
+            {
+                if (ev.RowIndex >= 0)
+                    EditAt(ev.RowIndex);
+            };
+
+            var addBtn = new Button { Text = "新增", Left = 14, Top = 396, Width = 76 };
+            var editBtn = new Button { Text = "编辑", Left = 98, Top = 396, Width = 76 };
+            var delBtn = new Button { Text = "删除", Left = 182, Top = 396, Width = 76 };
+            var upBtn = new Button { Text = "上移", Left = 266, Top = 396, Width = 76 };
+            var downBtn = new Button { Text = "下移", Left = 350, Top = 396, Width = 76 };
+            var okBtn = new Button { Text = "保存", Left = 546, Top = 396, Width = 76, DialogResult = DialogResult.OK };
+            var cancelBtn = new Button { Text = "取消", Left = 630, Top = 396, Width = 76, DialogResult = DialogResult.Cancel };
 
             addBtn.Click += delegate
             {
                 using (var dlg = new SubscriptionEditForm(new SubscriptionInfo { Name = "", Url = "" }, true))
                 {
-                    if (dlg.ShowDialog(this) == DialogResult.OK)
+                    if (dlg.ShowDialog(this) != DialogResult.OK)
+                        return;
+
+                    string reason;
+                    if (!ValidateCandidate(dlg.Value, -1, out reason))
                     {
-                        _items.Add(dlg.Value);
-                        _source.ResetBindings(false);
+                        MessageBox.Show(this, reason, "订阅无效",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
                     }
+
+                    _items.Add(dlg.Value);
+                    _source.ResetBindings(false);
+                    SelectRow(_items.Count - 1);
                 }
             };
 
             editBtn.Click += delegate
             {
-                if (_grid.CurrentRow == null) return;
-                int idx = _grid.CurrentRow.Index;
-                if (idx < 0 || idx >= _items.Count) return;
-                var current = _items[idx];
-                using (var dlg = new SubscriptionEditForm(new SubscriptionInfo { Name = current.Name, Url = current.Url }, false))
-                {
-                    if (dlg.ShowDialog(this) == DialogResult.OK)
-                    {
-                        _items[idx] = dlg.Value;
-                        _source.ResetBindings(false);
-                    }
-                }
+                int idx = CurrentIndex();
+                if (idx >= 0)
+                    EditAt(idx);
             };
 
             delBtn.Click += delegate
             {
-                if (_grid.CurrentRow == null) return;
-                int idx = _grid.CurrentRow.Index;
-                if (idx < 0 || idx >= _items.Count) return;
+                int idx = CurrentIndex();
+                if (idx < 0)
+                    return;
+
+                SubscriptionInfo item = _items[idx];
+                if (MessageBox.Show(this,
+                    "确定删除订阅 \"" + (string.IsNullOrEmpty(item.Name) ? "(未命名)" : item.Name) + "\" 吗？\r\n"
+                    + "仅从列表移除，不会改动已合并进配置的节点。",
+                    "删除订阅",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question) != DialogResult.Yes)
+                {
+                    return;
+                }
+
                 _items.RemoveAt(idx);
                 _source.ResetBindings(false);
+                if (_items.Count > 0)
+                    SelectRow(Math.Min(idx, _items.Count - 1));
             };
 
-            upBtn.Click += delegate
-            {
-                MoveSelected(-1);
-            };
+            upBtn.Click += delegate { MoveSelected(-1); };
+            downBtn.Click += delegate { MoveSelected(1); };
 
-            downBtn.Click += delegate
+            okBtn.Click += delegate
             {
-                MoveSelected(1);
+                if (!ValidateAll())
+                    DialogResult = DialogResult.None;
             };
 
             Controls.Add(_grid);
@@ -6107,21 +6809,215 @@ namespace MihomoTray
             AcceptButton = okBtn;
             CancelButton = cancelBtn;
             UiStyles.ApplyControls(this);
+            if (_items.Count > 0)
+                SelectRow(0);
+        }
+
+        void EditAt(int idx)
+        {
+            if (idx < 0 || idx >= _items.Count)
+                return;
+
+            SubscriptionInfo current = _items[idx];
+            using (var dlg = new SubscriptionEditForm(
+                new SubscriptionInfo { Name = current.Name, Url = current.Url }, false))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                string reason;
+                if (!ValidateCandidate(dlg.Value, idx, out reason))
+                {
+                    MessageBox.Show(this, reason, "订阅无效",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                _items[idx] = dlg.Value;
+                _source.ResetBindings(false);
+                SelectRow(idx);
+            }
+        }
+
+        /// <summary>校验单条订阅；skipIndex 用于编辑时排除自身。返回 false 时 reason 给出原因。</summary>
+        bool ValidateCandidate(SubscriptionInfo candidate, int skipIndex, out string reason)
+        {
+            reason = null;
+
+            if (candidate == null)
+            {
+                reason = "订阅内容为空。";
+                return false;
+            }
+
+            candidate.Name = (candidate.Name ?? "").Trim();
+            candidate.Url = (candidate.Url ?? "").Trim();
+
+            if (candidate.Name.Length == 0)
+            {
+                reason = "订阅名称不能为空。";
+                return false;
+            }
+            if (candidate.Url.Length == 0)
+            {
+                reason = "订阅链接不能为空。";
+                return false;
+            }
+            if (!Regex.IsMatch(candidate.Url, @"^https?://", RegexOptions.IgnoreCase))
+            {
+                reason = "订阅链接必须以 http:// 或 https:// 开头。";
+                return false;
+            }
+            if (candidate.Url.IndexOf(' ') >= 0)
+            {
+                reason = "订阅链接不能包含空格。";
+                return false;
+            }
+
+            for (int i = 0; i < _items.Count; i++)
+            {
+                if (i == skipIndex)
+                    continue;
+
+                if (string.Equals(_items[i].Name, candidate.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    reason = "已存在同名订阅：\r\n" + candidate.Name;
+                    return false;
+                }
+                if (string.Equals((_items[i].Url ?? "").Trim(), candidate.Url, StringComparison.Ordinal))
+                {
+                    reason = "该订阅链接已存在：\r\n" + candidate.Name;
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        bool ValidateAll()
+        {
+            var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seenUrls = new HashSet<string>(StringComparer.Ordinal);
+
+            for (int i = 0; i < _items.Count; i++)
+            {
+                SubscriptionInfo item = _items[i];
+                item.Name = (item.Name ?? "").Trim();
+                item.Url = (item.Url ?? "").Trim();
+
+                if (item.Name.Length == 0 || item.Url.Length == 0)
+                {
+                    MessageBox.Show(this, "第 " + (i + 1) + " 条订阅的名称或链接为空。",
+                        "订阅无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+                if (item.Url.Length > 0 && !Regex.IsMatch(item.Url, @"^https?://", RegexOptions.IgnoreCase))
+                {
+                    MessageBox.Show(this,
+                        "第 " + (i + 1) + " 条订阅的链接不是有效地址：\r\n" + item.Url,
+                        "订阅无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+                if (!seenNames.Add(item.Name))
+                {
+                    MessageBox.Show(this, "订阅名称重复：\r\n" + item.Name,
+                        "订阅重复", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+                if (!seenUrls.Add(item.Url))
+                {
+                    MessageBox.Show(this, "订阅链接重复：\r\n" + item.Name,
+                        "订阅重复", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+            }
+
+            _source.ResetBindings(false);
+            return true;
+        }
+
+        int CurrentIndex()
+        {
+            if (_grid.CurrentRow == null) return -1;
+            int idx = _grid.CurrentRow.Index;
+            if (idx < 0 || idx >= _items.Count) return -1;
+            return idx;
+        }
+
+        void SelectRow(int idx)
+        {
+            try
+            {
+                if (idx >= 0 && idx < _grid.Rows.Count)
+                    _grid.CurrentCell = _grid.Rows[idx].Cells[0];
+            }
+            catch { }
         }
 
         void MoveSelected(int delta)
         {
-            if (_grid.CurrentRow == null) return;
-            int idx = _grid.CurrentRow.Index;
+            int idx = CurrentIndex();
+            if (idx < 0) return;
             int newIdx = idx + delta;
-            if (idx < 0 || idx >= _items.Count) return;
             if (newIdx < 0 || newIdx >= _items.Count) return;
 
             var temp = _items[idx];
             _items[idx] = _items[newIdx];
             _items[newIdx] = temp;
             _source.ResetBindings(false);
-            _grid.CurrentCell = _grid.Rows[newIdx].Cells[0];
+            SelectRow(newIdx);
+        }
+
+        /// <summary>订阅链接脱敏：只保留协议与主机，token 用省略号替代。</summary>
+        internal static string MaskSubscriptionUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url))
+                return "";
+
+            try
+            {
+                var m = Regex.Match(url, @"^(https?://[^/?#]+)(.*)$", RegexOptions.IgnoreCase);
+                if (!m.Success)
+                    return url.Length > 48 ? url.Substring(0, 45) + "…" : url;
+
+                string basePart = m.Groups[1].Value;
+                string rest = m.Groups[2].Value;
+                if (rest.Length == 0)
+                    return basePart;
+
+                // 查询串往往承载 token，整体折叠为固定占位
+                if (rest.IndexOf('?') >= 0)
+                    return basePart + "/…?…";
+
+                if (rest.Length > 24)
+                    return basePart + "/…" + rest.Substring(rest.Length - 6);
+                return basePart + rest;
+            }
+            catch
+            {
+                return url;
+            }
+        }
+
+        internal static string ExtractHostStatic(string url)
+        {
+            if (string.IsNullOrEmpty(url))
+                return "";
+            try
+            {
+                var m = Regex.Match(url, @"^[a-zA-Z][a-zA-Z0-9+.\-]*://([^/?#]+)");
+                if (!m.Success)
+                    return "";
+                string hostPort = m.Groups[1].Value;
+                int at = hostPort.LastIndexOf('@');
+                if (at >= 0)
+                    hostPort = hostPort.Substring(at + 1);
+                return hostPort;
+            }
+            catch
+            {
+                return "";
+            }
         }
 
         public List<SubscriptionInfo> GetSubscriptions()
@@ -6134,6 +7030,7 @@ namespace MihomoTray
     {
         TextBox _nameBox;
         TextBox _urlBox;
+        Label _hint;
         public SubscriptionInfo Value { get; private set; }
 
         public SubscriptionEditForm(SubscriptionInfo item, bool isNew)
@@ -6145,39 +7042,62 @@ namespace MihomoTray
             MinimizeBox = false;
             MaximizeBox = false;
             ShowInTaskbar = false;
-            Width = 640;
-            Height = 220;
+            ClientSize = new Size(636, 208);
 
-            var nameLabel = new Label { Left = 12, Top = 18, Width = 80, Text = "名称" };
-            _nameBox = new TextBox { Left = 92, Top = 14, Width = 520, Text = item.Name };
+            var nameLabel = new Label { Left = 16, Top = 22, Width = 68, Text = "名称" };
+            _nameBox = new TextBox { Left = 90, Top = 18, Width = 528, Text = item.Name };
+            _nameBox.MaxLength = 120;
 
-            var urlLabel = new Label { Left = 12, Top = 54, Width = 80, Text = "链接" };
-            _urlBox = new TextBox { Left = 92, Top = 50, Width = 520, Text = item.Url };
+            var urlLabel = new Label { Left = 16, Top = 60, Width = 68, Text = "链接" };
+            _urlBox = new TextBox { Left = 90, Top = 56, Width = 528, Text = item.Url };
+            _urlBox.MaxLength = 2048;
 
-            var okBtn = new Button { Text = "确定", Left = 460, Top = 98, Width = 72, DialogResult = DialogResult.OK };
-            var cancelBtn = new Button { Text = "取消", Left = 540, Top = 98, Width = 72, DialogResult = DialogResult.Cancel };
+            _hint = new Label();
+            _hint.Left = 90;
+            _hint.Top = 84;
+            _hint.Width = 528;
+            _hint.Height = 34;
+            _hint.ForeColor = UiStyles.MutedText;
+            _hint.Text = "链接需以 http:// 或 https:// 开头，通常是机场提供的订阅地址。";
+
+            var okBtn = new Button { Text = "确定", Left = 456, Top = 150, Width = 76, DialogResult = DialogResult.OK };
+            var cancelBtn = new Button { Text = "取消", Left = 542, Top = 150, Width = 76, DialogResult = DialogResult.Cancel };
 
             okBtn.Click += delegate
             {
-                Value = new SubscriptionInfo { Name = _nameBox.Text.Trim(), Url = _urlBox.Text.Trim() };
-                if (Value.Name.Length == 0 || Value.Url.Length == 0)
+                string name = (_nameBox.Text ?? "").Trim();
+                string url = (_urlBox.Text ?? "").Trim();
+
+                if (name.Length == 0 || url.Length == 0)
                 {
-                    MessageBox.Show(this, "名称和链接不能为空。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MessageBox.Show(this, "名称和链接不能为空。", "提示",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     DialogResult = DialogResult.None;
                     return;
                 }
+                if (!Regex.IsMatch(url, @"^https?://", RegexOptions.IgnoreCase))
+                {
+                    MessageBox.Show(this, "链接需以 http:// 或 https:// 开头。", "链接格式不正确",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    DialogResult = DialogResult.None;
+                    return;
+                }
+
+                Value = new SubscriptionInfo { Name = name, Url = url };
             };
 
             Controls.Add(nameLabel);
             Controls.Add(_nameBox);
             Controls.Add(urlLabel);
             Controls.Add(_urlBox);
+            Controls.Add(_hint);
             Controls.Add(okBtn);
             Controls.Add(cancelBtn);
 
             AcceptButton = okBtn;
             CancelButton = cancelBtn;
             UiStyles.ApplyControls(this);
+            _nameBox.Select();
         }
     }
 

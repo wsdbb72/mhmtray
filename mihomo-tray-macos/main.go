@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -99,6 +100,9 @@ var (
 )
 
 var mihomoProcessNames = []string{"mihomo", "mihomo-alpha", "clash-meta", "Clash.Meta"}
+
+// subUpdateMu 串行化订阅更新：多个订阅合并进同一个活动配置，并行写会互相覆盖。
+var subUpdateMu sync.Mutex
 
 var (
 	tunStatusRe          = regexp.MustCompile(`(?m)(^tun:\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]+enable:\s*)(true|false)`)
@@ -282,9 +286,7 @@ func onReady() {
 	mSubAll := mSubMenu.AddSubMenuItem("Update All", "Download and merge all subscriptions")
 	go func() {
 		for range mSubAll.ClickedCh {
-			for _, s := range subs {
-				updateSubscription(s)
-			}
+			updateSubscriptions(subs)
 		}
 	}()
 	rebuildSubMenu(mSubMenu)
@@ -1235,28 +1237,104 @@ func appleScriptString(s string) string {
 }
 
 func updateSubscription(s SubInfo) {
+	updateSubscriptions([]SubInfo{s})
+}
+
+// updateSubscriptions 顺序更新一批订阅，结束后只重启一次核心。
+// 串行而非并行：多个订阅合并进同一个活动配置，并行写必然互相覆盖；
+// 且原本「每个订阅各重启一次核心」会导致 N 次无谓的连接中断。
+func updateSubscriptions(list []SubInfo) {
+	if len(list) == 0 {
+		return
+	}
+	if !subUpdateMu.TryLock() {
+		notify("Subscription update already in progress")
+		return
+	}
+	defer subUpdateMu.Unlock()
+
+	var ok, failed []string
+	var lastErr string
+
+	for i, s := range list {
+		if len(list) > 1 {
+			notify(fmt.Sprintf("Updating (%d/%d): %s", i+1, len(list), s.Name))
+		} else {
+			notify("Updating: " + s.Name)
+		}
+
+		if err := applySubscription(s); err != nil {
+			failed = append(failed, s.Name)
+			lastErr = err.Error()
+			continue
+		}
+		ok = append(ok, s.Name)
+	}
+
+	if len(ok) > 0 {
+		restartQuietly()
+	}
+
+	switch {
+	case len(failed) == 0:
+		if len(ok) == 1 {
+			notify("Updated: " + ok[0])
+		} else {
+			notify(fmt.Sprintf("Updated all %d subscriptions", len(ok)))
+		}
+	case len(ok) == 0:
+		notify(fmt.Sprintf("Update failed: %s", lastErr))
+	default:
+		notify(fmt.Sprintf("Updated %d, failed %d (%s)",
+			len(ok), len(failed), strings.Join(failed, ", ")))
+	}
+
+	refreshUI()
+}
+
+// applySubscription 下载并合并单个订阅；返回错误以便调用方汇总提示。
+func applySubscription(s SubInfo) error {
+	if strings.TrimSpace(s.URL) == "" {
+		return fmt.Errorf("subscription URL is empty")
+	}
+
 	resp, err := httpGet(s.URL)
 	if err != nil {
-		notify("Download failed: " + err.Error())
-		return
+		return fmt.Errorf("download failed: %v", err)
 	}
-	content := string(resp)
+
+	content := strings.TrimSpace(string(resp))
+	if content == "" {
+		return fmt.Errorf("empty response")
+	}
+
+	// 机场对失效订阅常返回 JSON 错误或 HTML 登录页，而不是配置
+	if strings.HasPrefix(content, "{") {
+		return fmt.Errorf("server returned JSON, subscription may be invalid")
+	}
+	if strings.HasPrefix(content, "<") {
+		return fmt.Errorf("server returned HTML, link may have expired")
+	}
+
 	if isBase64(content) {
-		dec, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(content))
-		if dec != nil {
-			content = string(dec)
+		dec, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(content), ""))
+		if err != nil || len(dec) == 0 {
+			return fmt.Errorf("base64 decode failed")
 		}
+		content = strings.TrimSpace(string(dec))
 	}
-	if err := mergeConfig(content); err != nil {
-		notify("Merge failed: " + err.Error())
+
+	return mergeConfig(content)
+}
+
+// restartQuietly 重启核心但保留「原本未运行」的语义，不产生启动提示。
+func restartQuietly() {
+	if !isRunning() {
 		return
 	}
-	if isRunning() {
-		stopMihomo()
-		time.Sleep(500 * time.Millisecond)
-		startMihomo()
-	}
-	refreshUI()
+	stopMihomo()
+	time.Sleep(500 * time.Millisecond)
+	startMihomo()
 }
 
 func mergeConfig(newYaml string) error {
@@ -1267,7 +1345,7 @@ func mergeConfig(newYaml string) error {
 	}
 	idx := findTopLevelKey(string(oldData), "proxies:")
 	if idx < 0 {
-		return fmt.Errorf("proxies: not found")
+		return fmt.Errorf("proxies: not found in active config")
 	}
 	subIdx := findTopLevelKey(newYaml, "proxies:")
 	if subIdx < 0 {
