@@ -149,9 +149,10 @@ namespace MihomoTray
         ToolStripMenuItem _tunItem;
         ToolStripMenuItem _proxyItem;
         ToolStripMenuItem _proxyGuardItem;
-        ToolStripMenuItem _subMenu;
-        ToolStripMenuItem _subMgrItem;
+        /// <summary>顶层「配置切换」——悬停时动态填充已添加配置文件的名称。</summary>
         ToolStripMenuItem _profileItem;
+        /// <summary>顶层「一键更新订阅」——对应原先「配置与订阅 &gt; 更新订阅 &gt; 更新全部订阅」。</summary>
+        ToolStripMenuItem _updateAllSubsItem;
         ToolStripMenuItem _appProxyMenu;
         ToolStripMenuItem _appProxyAllItem;
         ToolStripMenuItem _appProxyServiceItem;
@@ -491,24 +492,27 @@ namespace MihomoTray
 
             _menu.Items.Add(new ToolStripSeparator());
 
-            var configMenu = new ToolStripMenuItem("配置与订阅");
-            configMenu.Image = UiStyles.MenuIcon("profile", false);
-            _profileItem = new ToolStripMenuItem("配置切换", null, OnProfileManager);
+            // ──── 配置切换（顶层）────
+            //
+            // 用户反馈：原先「配置切换」埋在「配置与订阅」子菜单里，
+            // 和订阅管理混在一起，右键根本看不到、也分不清"切换配置"和"管理订阅"
+            // 是两件事。现在：
+            //   · 配置切换提到顶层，右键立刻可见；
+            //   · 悬停直接列出**已添加配置文件的名称**，一步切换；
+            //   · 列表末尾给「编辑配置…」，在那里新增/编辑/删除订阅。
+            //   · 原来的「配置与订阅」子菜单整体删除。
+            _profileItem = new ToolStripMenuItem("配置切换");
             _profileItem.Image = UiStyles.MenuIcon("profile", false);
-            configMenu.DropDownItems.Add(_profileItem);
+            _profileItem.DropDownOpening += OnProfileMenuOpening;
+            _menu.Items.Add(_profileItem);
 
-            _subMenu = new ToolStripMenuItem("更新订阅");
-            _subMenu.Image = UiStyles.MenuIcon("refresh", false);
-            configMenu.DropDownItems.Add(_subMenu);
+            // 一键更新订阅：把原先藏在「配置与订阅 > 更新订阅」里的批量更新
+            // 提到顶层，右键两步之内就能触发。
+            _updateAllSubsItem = new ToolStripMenuItem("一键更新订阅", null, OnUpdateAllSubscriptions);
+            _updateAllSubsItem.Image = UiStyles.MenuIcon("download", false);
+            _menu.Items.Add(_updateAllSubsItem);
 
-            _subMgrItem = new ToolStripMenuItem("订阅管理", null, OnSubscriptionManager);
-            _subMgrItem.Image = UiStyles.MenuIcon("list", false);
-            configMenu.DropDownItems.Add(_subMgrItem);
-
-            var editSubItem = new ToolStripMenuItem("编辑订阅源", null, OnEditSubConfig);
-            editSubItem.Image = UiStyles.MenuIcon("edit", false);
-            configMenu.DropDownItems.Add(editSubItem);
-            _menu.Items.Add(configMenu);
+            _menu.Items.Add(new ToolStripSeparator());
 
             var toolsMenu = new ToolStripMenuItem("工具");
             toolsMenu.Image = UiStyles.MenuIcon("settings", false);
@@ -888,13 +892,16 @@ namespace MihomoTray
             // 总开关：关闭/启动 ProxiFyre 服务本身。
             // 用户明确反馈"缺少关闭选项"——原先只有「停用全部代理」（清空名单+重启服务），
             // 服务仍在运行；这里给出真正把服务停掉的一键开关。
+            //
+            // 非管理员时不再提示"（需管理员）"——因为点击后会**自动弹 UAC**，
+            // 写提示反而让人以为"点了也没用"。改用"将提权"更贴近实际行为。
             _appProxyServiceItem = new ToolStripMenuItem(
                 running ? "关闭 ProxiFyre（停止服务）" : "启动 ProxiFyre 服务",
                 null, OnToggleProxiFyreService);
             _appProxyServiceItem.Image = UiStyles.MenuIcon(running ? "off" : "on", running);
             _appProxyServiceItem.Tag = running ? "danger" : null;
             if (!_isAdmin)
-                _appProxyServiceItem.Text += "（需管理员）";
+                _appProxyServiceItem.Text += "（将请求管理员权限）";
             _appProxyMenu.DropDownItems.Add(_appProxyServiceItem);
 
             _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
@@ -1073,66 +1080,230 @@ namespace MihomoTray
         // ──── Refresh UI ────
 
         /// <summary>
-        /// 重建「更新订阅」子菜单。
-        /// 每个订阅是一个二级菜单：点开后可分别「更新」或「应用为当前配置」，
-        /// 避免原先「点名字=更新」把两个不同语义的动作混在一个入口上。
+        /// 重建顶层「配置切换」下拉内容。
+        ///
+        /// 用户要求："鼠标悬停弹出几个快捷切换的选项，选项是已添加配置文件的名字，
+        /// 然后下面有一个编辑配置的选项，可以在这里面新增编辑或者删除订阅。"
+        ///
+        /// 结构：
+        ///   ├ ✎ 编辑配置…            ← 打开配置+订阅编辑面板（新增/编辑/删除订阅）
+        ///   ├ ───────────
+        ///   ├ ✓ 机场A                ← 已添加的配置文件名，点击即切换
+        ///   ├   机场B
+        ///   └ ───────────
+        ///     （无配置时显示"（尚未添加配置）"占位）
+        ///
+        /// 性能：本方法在 DropDownOpening 时调用，属于菜单渲染路径。
+        /// 因此只读内存里的 _profiles（LoadTrayConfig 已在启动/保存时填好），
+        /// 绝不在这里重新解析 tray-config.json。
         /// </summary>
-        void RefreshSubscriptions()
+        void RefreshProfileMenu()
         {
-            _subMenu.DropDownItems.Clear();
+            if (_profileItem == null)
+                return;
 
-            var subs = LoadSubscriptions();
-            if (subs.Count == 0)
+            _profileItem.DropDownItems.Clear();
+
+            // 当前活动配置：放在最上面一行做标题，让用户一眼知道现在在哪套配置上。
+            string activeName = GetActiveProfileName();
+            if (activeName.Length > 0)
             {
-                var empty = new ToolStripMenuItem("(无订阅配置)");
-                empty.Enabled = false;
-                empty.Image = UiStyles.MenuIcon("empty", false);
-                _subMenu.DropDownItems.Add(empty);
+                var caption = new ToolStripMenuItem("当前：" + activeName);
+                caption.Enabled = false;
+                caption.Image = UiStyles.MenuIcon("status-on", true);
+                caption.Tag = "caption";
+                _profileItem.DropDownItems.Add(caption);
+                _profileItem.DropDownItems.Add(new ToolStripSeparator());
+            }
 
-                var addHint = new ToolStripMenuItem("添加订阅…", null, OnSubscriptionManager);
-                addHint.Image = UiStyles.MenuIcon("plus", false);
-                _subMenu.DropDownItems.Add(addHint);
+            if (_profiles.Count == 0)
+            {
+                var none = new ToolStripMenuItem("（尚未添加配置）");
+                none.Enabled = false;
+                none.Image = UiStyles.MenuIcon("empty", false);
+                _profileItem.DropDownItems.Add(none);
             }
             else
             {
-                foreach (var sub in subs)
+                foreach (var prof in _profiles)
                 {
-                    SubscriptionInfo subRef = sub;
-
-                    var parent = new ToolStripMenuItem(
-                        BuildSubscriptionLabel(subRef),
-                        UiStyles.MenuIcon("refresh", false));
-
-                    var updateOne = new ToolStripMenuItem("更新此订阅", null,
-                        delegate { OnUpdateSubscription(subRef); });
-                    updateOne.Image = UiStyles.MenuIcon("refresh", false);
-                    parent.DropDownItems.Add(updateOne);
-
-                    var switchOne = new ToolStripMenuItem("应用为当前配置", null,
-                        delegate { OnApplySubscription(subRef); });
-                    switchOne.Image = UiStyles.MenuIcon("profile", false);
-                    parent.DropDownItems.Add(switchOne);
-
-                    var copyUrl = new ToolStripMenuItem("复制订阅链接", null,
-                        delegate { CopySubscriptionUrl(subRef); });
-                    copyUrl.Image = UiStyles.MenuIcon("list", false);
-                    parent.DropDownItems.Add(copyUrl);
-
-                    _subMenu.DropDownItems.Add(parent);
+                    ConfigProfile captured = prof;
+                    bool isActive = IsProfileActive(captured);
+                    var item = new ToolStripMenuItem(
+                        captured.Name,
+                        null,
+                        delegate { OnSwitchProfile(captured); });
+                    item.Checked = isActive;
+                    item.Image = UiStyles.MenuIcon(isActive ? "status-on" : "profile", isActive);
+                    _profileItem.DropDownItems.Add(item);
                 }
-
-                _subMenu.DropDownItems.Add(new ToolStripSeparator());
-
-                var updateAll = new ToolStripMenuItem("更新全部订阅", null, OnUpdateAllSubscriptions);
-                updateAll.Image = UiStyles.MenuIcon("download", false);
-                _subMenu.DropDownItems.Add(updateAll);
-
-                var manage = new ToolStripMenuItem("订阅管理…", null, OnSubscriptionManager);
-                manage.Image = UiStyles.MenuIcon("list", false);
-                _subMenu.DropDownItems.Add(manage);
             }
 
-            UiStyles.ApplyMenuItems(_subMenu.DropDown);
+            _profileItem.DropDownItems.Add(new ToolStripSeparator());
+
+            // 编辑配置：把"配置列表编辑"与"订阅增删改"合并到一个入口。
+            // 原先分散在「配置切换」和「订阅管理」两个对话框里，用户得先想清楚
+            // 要改的是"配置"还是"订阅"，实际上它们描述的是同一件事的两面。
+            var editItem = new ToolStripMenuItem("编辑配置…", null, OnEditConfigAndSubscriptions);
+            editItem.Image = UiStyles.MenuIcon("edit", false);
+            _profileItem.DropDownItems.Add(editItem);
+
+            // 摘要行：让用户知道这里还管着几个订阅，不需要点进去才发现。
+            int subCount = LoadSubscriptionsCountCached();
+            if (subCount > 0)
+            {
+                var subInfo = new ToolStripMenuItem(
+                    string.Format("（含 {0} 个订阅源，可在此新增/编辑/删除）", subCount));
+                subInfo.Enabled = false;
+                subInfo.Image = UiStyles.MenuIcon("list", false);
+                subInfo.Tag = "caption";
+                _profileItem.DropDownItems.Add(subInfo);
+            }
+
+            // 顶层标签带上当前配置名，不用点开就知道现状。
+            _profileItem.Text = activeName.Length > 0
+                ? "配置切换：" + activeName
+                : "配置切换";
+            _profileItem.Image = UiStyles.MenuIcon(
+                _profiles.Count > 0 ? "profile" : "profile", false);
+
+            UiStyles.ApplyMenuItems(_profileItem.DropDown);
+        }
+
+        /// <summary>悬停时重建配置列表。必须零阻塞（见菜单性能铁律）。</summary>
+        void OnProfileMenuOpening(object sender, EventArgs e)
+        {
+            RefreshProfileMenu();
+        }
+
+        /// <summary>取当前活动配置对应的显示名；找不到则回退为文件名。</summary>
+        string GetActiveProfileName()
+        {
+            for (int i = 0; i < _profiles.Count; i++)
+            {
+                if (IsProfileActive(_profiles[i]))
+                    return _profiles[i].Name;
+            }
+            try
+            {
+                if (!string.IsNullOrEmpty(_activeConfigPath))
+                    return Path.GetFileNameWithoutExtension(_activeConfigPath);
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>判断某个配置项是否为当前活动配置（路径比较，避免同名不同路径误判）。</summary>
+        bool IsProfileActive(ConfigProfile prof)
+        {
+            if (prof == null || string.IsNullOrEmpty(prof.Path))
+                return false;
+            try
+            {
+                return PathsEqual(ResolveRelativePath(prof.Path), _activeConfigPath);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 订阅数量的廉价读取：只用内存里的 subs 列表，不重新读文件。
+        /// 菜单渲染路径上严禁做 I/O。
+        /// </summary>
+        int LoadSubscriptionsCountCached()
+        {
+            try { return subs == null ? 0 : subs.Count; }
+            catch { return 0; }
+        }
+
+        /// <summary>快捷切换配置：点击即切换活动配置并重启核心（若在运行）。</summary>
+        void OnSwitchProfile(ConfigProfile prof)
+        {
+            if (prof == null)
+                return;
+
+            string newPath;
+            try { newPath = ResolveRelativePath(prof.Path); }
+            catch { return; }
+
+            if (!File.Exists(newPath))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "配置文件不存在，无法切换：\n" + newPath,
+                    ToolTipIcon.Warning);
+                return;
+            }
+
+            if (PathsEqual(newPath, _activeConfigPath))
+                return;   // 已经是当前配置，静默忽略（避免无谓地重启核心）
+
+            string previousActiveConfigPath = _activeConfigPath;
+            _activeConfigPath = newPath;
+            ResolveActiveConfig();
+
+            if (!PathsEqual(previousActiveConfigPath, _activeConfigPath))
+            {
+                ApplySavedTunMode();
+                SaveTrayConfig();
+
+                bool wasRunning = IsMihomoRunning();
+                if (wasRunning)
+                {
+                    StopMihomo();
+                    System.Threading.Thread.Sleep(500);
+                    StartMihomo();
+                }
+
+                ApplySavedSystemProxyMode();
+                _trayIcon.ShowBalloonTip(2000, "Mihomo",
+                    "已切换到：" + prof.Name,
+                    ToolTipIcon.Info);
+            }
+
+            RefreshUI();
+        }
+
+        /// <summary>
+        /// 「编辑配置…」入口：合并原先的「配置切换」对话框与「订阅管理」对话框。
+        /// 用标签页把两件事放在同一处，用户不必再猜改哪个。
+        /// </summary>
+        void OnEditConfigAndSubscriptions(object sender, EventArgs e)
+        {
+            using (var dlg = new ConfigAndSubscriptionForm(
+                _profiles, _activeConfigPath, _basePath,
+                new List<SubscriptionInfo>(subs)))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                bool wasRunning = IsMihomoRunning();
+                string previousActiveConfigPath = _activeConfigPath;
+
+                _profiles = dlg.GetProfiles();
+                _activeConfigPath = dlg.GetActiveConfigPath();
+                ResolveActiveConfig();
+                subs = dlg.GetSubscriptions();
+
+                bool activeChanged = !PathsEqual(previousActiveConfigPath, _activeConfigPath);
+
+                ApplySavedTunMode();
+                SaveTrayConfig();
+
+                if (wasRunning && activeChanged)
+                {
+                    StopMihomo();
+                    System.Threading.Thread.Sleep(500);
+                    StartMihomo();
+                }
+
+                ApplySavedSystemProxyMode();
+                RefreshUI();
+
+                _trayIcon.ShowBalloonTip(2000, "Mihomo",
+                    activeChanged
+                        ? "已切换到：" + Path.GetFileName(_activeConfigPath)
+                        : "配置与订阅已更新",
+                    ToolTipIcon.Info);
+            }
         }
 
         /// <summary>订阅菜单项标题：名称 + 主机名，便于区分同名的不同机场。</summary>
@@ -1198,8 +1369,8 @@ namespace MihomoTray
             }
 
             _isUpdatingSubscription = true;
-            if (_subMgrItem != null) _subMgrItem.Enabled = false;
-            if (_subMenu != null) _subMenu.Enabled = false;
+            if (_updateAllSubsItem != null) _updateAllSubsItem.Enabled = false;
+            if (_profileItem != null) _profileItem.Enabled = false;
 
             var self = this;
             new Thread((ThreadStart)delegate
@@ -1236,8 +1407,8 @@ namespace MihomoTray
                     finally
                     {
                         _isUpdatingSubscription = false;
-                        if (_subMgrItem != null) _subMgrItem.Enabled = true;
-                        if (_subMenu != null) _subMenu.Enabled = true;
+                        if (_updateAllSubsItem != null) _updateAllSubsItem.Enabled = true;
+                        if (_profileItem != null) _profileItem.Enabled = true;
                         RefreshUI();
                     }
                 }));
@@ -3064,7 +3235,7 @@ namespace MihomoTray
 
                 subs = dlg.GetSubscriptions();
                 SaveTrayConfig();
-                RefreshSubscriptions();
+                RefreshProfileMenu();
                 _trayIcon.ShowBalloonTip(2000, "Mihomo",
                     "订阅列表已更新",
                     ToolTipIcon.Info);
@@ -3123,8 +3294,8 @@ namespace MihomoTray
                 return;
 
             _isUpdatingSubscription = true;
-            if (_subMgrItem != null) _subMgrItem.Enabled = false;
-            if (_subMenu != null) _subMenu.Enabled = false;
+            if (_updateAllSubsItem != null) _updateAllSubsItem.Enabled = false;
+            if (_profileItem != null) _profileItem.Enabled = false;
 
             var self = this;
             new Thread((ThreadStart)delegate
@@ -3205,8 +3376,8 @@ namespace MihomoTray
                     finally
                     {
                         _isUpdatingSubscription = false;
-                        if (_subMgrItem != null) _subMgrItem.Enabled = true;
-                        if (_subMenu != null) _subMenu.Enabled = true;
+                        if (_updateAllSubsItem != null) _updateAllSubsItem.Enabled = true;
+                        if (_profileItem != null) _profileItem.Enabled = true;
                         RefreshUI();
                     }
                 }));
@@ -4169,22 +4340,37 @@ namespace MihomoTray
         /// <summary>
         /// 让 ProxiFyre 重新加载配置。ProxiFyre 只在启动时读配置，
         /// 因此需要重启服务才能生效。
+        /// 非管理员时自动弹 UAC（否则用户会看到"需要管理员权限"却不知如何是好）。
         /// </summary>
         bool RestartProxiFyreService(out string error)
         {
             error = null;
-            if (!_isAdmin)
-            {
-                error = "需要管理员权限才能重启 ProxiFyreService";
-                return false;
-            }
-
             try
             {
+                // 先尝试停：停不动（服务本来就没运行）也无所谓，继续走 start。
+                string stopOut;
+                bool stopCancelled;
+                RunScElevated("stop " + ProxiFyreServiceName, out stopOut, out stopCancelled);
+                if (stopCancelled)
+                {
+                    error = "已取消提权，服务未重启";
+                    return false;
+                }
                 KillProxiFyreProcesses();
-                RunSc("stop " + ProxiFyreServiceName);
                 Thread.Sleep(1200);
-                string output = RunSc("start " + ProxiFyreServiceName);
+
+                string output;
+                bool cancelled;
+                if (!RunScElevated("start " + ProxiFyreServiceName, out output, out cancelled))
+                {
+                    if (cancelled)
+                    {
+                        error = "已取消提权，服务未重启";
+                        return false;
+                    }
+                    error = string.IsNullOrEmpty(output) ? "提权执行失败" : output.Trim();
+                    return false;
+                }
                 Thread.Sleep(1500);
                 if (output.IndexOf("失败", StringComparison.Ordinal) >= 0 ||
                     output.IndexOf("FAILED", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -4227,7 +4413,18 @@ namespace MihomoTray
         /// </summary>
         bool EnsureProxiFyreRunning(out string error)
         {
+            bool cancelled;
+            return EnsureProxiFyreRunning(out error, out cancelled);
+        }
+
+        /// <summary>
+        /// 确保 ProxiFyreService 处于运行状态（带 UAC 提权版本）。
+        /// 非管理员时会自动弹 UAC，用户点"否"则 cancelled=true。
+        /// </summary>
+        bool EnsureProxiFyreRunning(out string error, out bool cancelled)
+        {
             error = null;
+            cancelled = false;
             if (!IsProxiFyreInstalled())
             {
                 error = "未检测到 ProxiFyre";
@@ -4236,15 +4433,17 @@ namespace MihomoTray
             if (IsProxiFyreRunning())
                 return true;
 
-            if (!_isAdmin)
-            {
-                error = "需要管理员权限才能启动 ProxiFyreService";
-                return false;
-            }
-
             try
             {
-                string output = RunSc("start " + ProxiFyreServiceName);
+                string output;
+                if (!RunScElevated("start " + ProxiFyreServiceName, out output, out cancelled))
+                {
+                    if (cancelled)
+                        return false;
+                    error = string.IsNullOrEmpty(output) ? "提权执行失败" : output.Trim();
+                    return false;
+                }
+
                 Thread.Sleep(1500);
                 if (IsProxiFyreRunning())
                     return true;
@@ -4283,24 +4482,32 @@ namespace MihomoTray
         ///   停止服务     = 服务本身停掉，ProxiFyre 的 NDIS 过滤驱动卸载，
         ///                  所有按应用代理规则彻底失效，直到再次启动。
         /// 两者都让流量回归系统默认路由，但停止服务更彻底（也不占内存/不占驱动）。
+        ///
+        /// 非管理员时会**自动弹出 UAC**（用户明确要求的行为），
+        /// 用户在 UAC 上点"否"则返回 cancelled=true，调用方据此给出"已取消"而非"失败"。
         /// </summary>
-        bool StopProxiFyreService(out string error)
+        bool StopProxiFyreService(out string error, out bool cancelled)
         {
             error = null;
+            cancelled = false;
             if (!IsProxiFyreInstalled())
             {
                 error = "未检测到 ProxiFyre";
                 return false;
             }
-            if (!_isAdmin)
-            {
-                error = "需要管理员权限才能停止 ProxiFyreService";
-                return false;
-            }
 
             try
             {
-                string output = RunSc("stop " + ProxiFyreServiceName);
+                string output;
+                if (!RunScElevated("stop " + ProxiFyreServiceName, out output, out cancelled))
+                {
+                    // 用户取消：不是错误，不要污染 error 字段让调用方弹"失败"。
+                    if (cancelled)
+                        return false;
+                    error = string.IsNullOrEmpty(output) ? "提权执行失败" : output.Trim();
+                    return false;
+                }
+
                 // sc stop 是异步的：发完请求就返回，服务需要一点时间真正退出。
                 // 这里轮询等待，避免"刚点完停止、快照里还是运行中"的观感错位。
                 DateTime deadline = DateTime.UtcNow.AddSeconds(8);
@@ -4311,7 +4518,10 @@ namespace MihomoTray
                     Thread.Sleep(250);
                 }
 
-                // 兜底：服务管理器没停下来就强杀进程，保证"关闭"这个语义生效
+                // 兜底：服务管理器没停下来就强杀进程，保证"关闭"这个语义生效。
+                // 注意：强杀 ProxiFyre.exe 本身在普通权限下也可能失败，
+                // 但此时 sc stop 已执行过，SCM 会把服务标记为停止，
+                // 驱动随之卸载——这才是"关闭"的实质。
                 KillProxiFyreProcesses();
                 Thread.Sleep(400);
 
@@ -4333,20 +4543,31 @@ namespace MihomoTray
         void OnToggleProxiFyreService(object sender, EventArgs e)
         {
             string error;
+            bool cancelled;
 
             // 这里刻意**不**用 _snapshotProxiFyreRunning 决定动作：
             // 快照最多有 SnapshotIntervalMs(3s) 的滞后，用户连续点击时
-            // 很可能读到过期的状态，于是同一个动作被执行两次
+            // 很可能读到过期的状态，于是同一个动作被被执行两次
             // （想开变成又想关，或者反之），表现为"点了没反应/越点越乱"。
             // 启停是低频的用户显式操作，改为现场问一次权威状态，代价可接受。
             bool running = IsProxiFyreRunning();
 
             if (running)
             {
-                if (!StopProxiFyreService(out error))
+                if (!StopProxiFyreService(out error, out cancelled))
                 {
-                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                        "停止 ProxiFyre 服务失败：" + error, ToolTipIcon.Error);
+                    if (cancelled)
+                    {
+                        // 用户在 UAC 上点了"否"：这是正常选择，不该报"失败"。
+                        _trayIcon.ShowBalloonTip(2500, "Mihomo",
+                            "已取消：未获得管理员权限，ProxiFyre 仍在运行",
+                            ToolTipIcon.Info);
+                    }
+                    else
+                    {
+                        _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                            "停止 ProxiFyre 服务失败：" + error, ToolTipIcon.Error);
+                    }
                     RefreshUI();
                     return;
                 }
@@ -4356,10 +4577,19 @@ namespace MihomoTray
             }
             else
             {
-                if (!EnsureProxiFyreRunning(out error))
+                if (!EnsureProxiFyreRunning(out error, out cancelled))
                 {
-                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                        "启动 ProxiFyre 服务失败：" + error, ToolTipIcon.Error);
+                    if (cancelled)
+                    {
+                        _trayIcon.ShowBalloonTip(2500, "Mihomo",
+                            "已取消：未获得管理员权限，ProxiFyre 未启动",
+                            ToolTipIcon.Info);
+                    }
+                    else
+                    {
+                        _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                            "启动 ProxiFyre 服务失败：" + error, ToolTipIcon.Error);
+                    }
                     RefreshUI();
                     return;
                 }
@@ -4395,6 +4625,106 @@ namespace MihomoTray
             catch (Exception ex)
             {
                 return ex.Message;
+            }
+        }
+
+        // ──── 提权执行 sc 命令 ────
+        //
+        // 用户明确要求："点击停止 ProxiFyre 时应该能自动弹出 UAC 窗口"。
+        // 之前普通权限下只是回一句"需要管理员权限"，用户必须自己去托盘里
+        // 找「以管理员身份重启」——多一步且不直观。
+        //
+        // 实现要点（这里有几个容易踩的坑）：
+        //   1) sc.exe 是控制台程序，用 Process.Start + runas 会**弹出一个黑框**。
+        //      必须用 WindowStyle.Hidden 并把输出重定向到临时文件，才能既提权又无窗口。
+        //   2) 提权后的进程是**独立进程**，我们拿不到它的 exit code
+        //      （Process.Start 返回的句柄在 runas 场景下 WaitForExit 常拿不到真实结果，
+        //       且 UAC 被拒绝时会直接抛 Win32Exception 1223）。
+        //      因此用"哨兵文件"传递结果：子进程写回 stdout+stderr，父进程读文件。
+        //   3) 必须区分「用户点了"否"」和「命令真的失败」——
+        //      前者是 Win32Exception.NativeErrorCode == 1223 (ERROR_CANCELLED)，
+        //      要给出"已取消"而不是"失败"，否则用户会以为程序坏了。
+        //   4) 提权进程与托盘是父子无关的，不会影响托盘的 UAC 状态：
+        //      停完服务托盘自己仍是普通权限，这是对的（不该因为停个服务就全局提权）。
+
+        /// <summary>ERROR_CANCELLED：用户在 UAC 对话框上点了"否"。</summary>
+        const int ErrorCancelled = 1223;
+
+        /// <summary>
+        /// 以管理员身份执行一条 sc 命令，必要时弹出 UAC。
+        /// 已经是管理员时直接走 RunSc（不弹窗）。
+        /// </summary>
+        /// <param name="arguments">sc.exe 的参数，如 "stop ProxiFyreService"</param>
+        /// <param name="output">命令输出（提权路径下从临时文件读回）</param>
+        /// <param name="cancelled">用户在 UAC 上点了"否"</param>
+        /// <returns>命令是否成功执行（不代表服务状态已达预期，调用方仍需轮询确认）</returns>
+        bool RunScElevated(string arguments, out string output, out bool cancelled)
+        {
+            output = "";
+            cancelled = false;
+
+            // 已是管理员：不必提权，省掉一次无谓的 UAC。
+            if (_isAdmin)
+            {
+                output = RunSc(arguments);
+                return true;
+            }
+
+            string token = Guid.NewGuid().ToString("N");
+            string outFile = Path.Combine(Path.GetTempPath(),
+                "mhmtray-sc-" + token + ".txt");
+
+            // 用 cmd 包一层，把 sc 的 stdout+stderr 都落盘。
+            // 2>&1 保证错误信息（如"服务未启动"）也能被看到。
+            // /c 之后整体作为 cmd 的参数；路径已加引号防空格。
+            string cmdArgs = "/c sc.exe " + arguments + " > \"" + outFile + "\" 2>&1";
+
+            try
+            {
+                var psi = new ProcessStartInfo("cmd.exe", cmdArgs);
+                psi.UseShellExecute = true;      // 必须：UseShellExecute=false 时 Verb 无效
+                psi.Verb = "runas";              // 触发 UAC
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                psi.CreateNoWindow = true;
+
+                using (var proc = Process.Start(psi))
+                {
+                    if (proc != null)
+                    {
+                        // 等提权进程结束，最多 20 秒（sc stop 正常在 1 秒内返回）
+                        try { proc.WaitForExit(20000); } catch { }
+                    }
+                }
+
+                // 读回输出。提权进程已经退出，文件内容稳定。
+                try
+                {
+                    if (File.Exists(outFile))
+                        output = File.ReadAllText(outFile, Encoding.UTF8);
+                }
+                catch { }
+                return true;
+            }
+            catch (System.ComponentModel.Win32Exception wex)
+            {
+                // 1223 = 用户在 UAC 对话框上点了"否"，这不是错误，是用户意图。
+                if (wex.NativeErrorCode == ErrorCancelled)
+                {
+                    cancelled = true;
+                    output = "";
+                    return false;
+                }
+                output = wex.Message;
+                return false;
+            }
+            catch (Exception ex)
+            {
+                output = ex.Message;
+                return false;
+            }
+            finally
+            {
+                try { if (File.Exists(outFile)) File.Delete(outFile); } catch { }
             }
         }
 
@@ -7249,15 +7579,36 @@ namespace MihomoTray
         Label _hint;
 
         public SubscriptionManagerForm(List<SubscriptionInfo> items)
+            : this(items, false)
+        {
+        }
+
+        /// <summary>
+        /// embedded=true 时构建为"可嵌入宿主"的形态：
+        /// 不设标题/尺寸，不添加"保存/取消"按钮（由宿主统一负责），
+        /// 网格随 Dock 填充。这样它既能独立弹窗，也能挂进 TabPage。
+        /// </summary>
+        public SubscriptionManagerForm(List<SubscriptionInfo> items, bool embedded)
         {
             Text = "订阅管理";
             UiStyles.ApplyForm(this);
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            StartPosition = FormStartPosition.CenterParent;
-            MinimizeBox = false;
-            MaximizeBox = false;
-            ShowInTaskbar = false;
-            ClientSize = new Size(720, 452);
+
+            if (embedded)
+            {
+                // 嵌入式：让控件自己铺满，不做 FixedDialog 的对话框装饰。
+                FormBorderStyle = FormBorderStyle.None;
+                Dock = DockStyle.Fill;
+                ClientSize = new Size(700, 420);
+            }
+            else
+            {
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                StartPosition = FormStartPosition.CenterParent;
+                MinimizeBox = false;
+                MaximizeBox = false;
+                ShowInTaskbar = false;
+                ClientSize = new Size(720, 452);
+            }
 
             _items = items == null ? new List<SubscriptionInfo>() : new List<SubscriptionInfo>(items);
             _source = new BindingSource();
@@ -7266,17 +7617,26 @@ namespace MihomoTray
             _hint = new Label();
             _hint.Left = 14;
             _hint.Top = 12;
-            _hint.Width = 692;
             _hint.Height = 18;
             _hint.Text = "按「更新此订阅」拉取节点并写入当前配置；双击可编辑名称与链接。";
             _hint.ForeColor = UiStyles.MutedText;
+            if (embedded)
+            {
+                // 嵌入式下宽度由 Dock 决定，用 Anchor 让它跟着宿主拉伸
+                _hint.Width = ClientSize.Width - 28;
+                _hint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            }
+            else
+            {
+                _hint.Width = 692;
+            }
             Controls.Add(_hint);
 
             _grid = new DataGridView();
             _grid.Left = 14;
             _grid.Top = 36;
-            _grid.Width = 692;
-            _grid.Height = 348;
+            _grid.Width = embedded ? ClientSize.Width - 28 : 692;
+            _grid.Height = embedded ? ClientSize.Height - 92 : 348;
             _grid.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             _grid.AutoGenerateColumns = false;
             _grid.AllowUserToAddRows = false;
@@ -7332,13 +7692,26 @@ namespace MihomoTray
                     EditAt(ev.RowIndex);
             };
 
-            var addBtn = new Button { Text = "新增", Left = 14, Top = 396, Width = 76 };
-            var editBtn = new Button { Text = "编辑", Left = 98, Top = 396, Width = 76 };
-            var delBtn = new Button { Text = "删除", Left = 182, Top = 396, Width = 76 };
-            var upBtn = new Button { Text = "上移", Left = 266, Top = 396, Width = 76 };
-            var downBtn = new Button { Text = "下移", Left = 350, Top = 396, Width = 76 };
-            var okBtn = new Button { Text = "保存", Left = 546, Top = 396, Width = 76, DialogResult = DialogResult.OK };
-            var cancelBtn = new Button { Text = "取消", Left = 630, Top = 396, Width = 76, DialogResult = DialogResult.Cancel };
+            // 按钮行：嵌入式下贴着底部（由 Anchor 跟随），且不放"保存/取消"
+            // ——那两个按钮由宿主 ConfigAndSubscriptionForm 统一提供，
+            // 否则会出现两套保存按钮互相打架。
+            int btnTop = embedded ? ClientSize.Height - 40 : 396;
+            var btnAnchor = embedded
+                ? (AnchorStyles.Bottom | AnchorStyles.Left)
+                : AnchorStyles.Top;
+
+            var addBtn = new Button { Text = "新增", Left = 14, Top = btnTop, Width = 76, Anchor = btnAnchor };
+            var editBtn = new Button { Text = "编辑", Left = 98, Top = btnTop, Width = 76, Anchor = btnAnchor };
+            var delBtn = new Button { Text = "删除", Left = 182, Top = btnTop, Width = 76, Anchor = btnAnchor };
+            var upBtn = new Button { Text = "上移", Left = 266, Top = btnTop, Width = 76, Anchor = btnAnchor };
+            var downBtn = new Button { Text = "下移", Left = 350, Top = btnTop, Width = 76, Anchor = btnAnchor };
+            Button okBtn = null;
+            Button cancelBtn = null;
+            if (!embedded)
+            {
+                okBtn = new Button { Text = "保存", Left = 546, Top = btnTop, Width = 76, DialogResult = DialogResult.OK };
+                cancelBtn = new Button { Text = "取消", Left = 630, Top = btnTop, Width = 76, DialogResult = DialogResult.Cancel };
+            }
 
             addBtn.Click += delegate
             {
@@ -7394,11 +7767,14 @@ namespace MihomoTray
             upBtn.Click += delegate { MoveSelected(-1); };
             downBtn.Click += delegate { MoveSelected(1); };
 
-            okBtn.Click += delegate
+            if (okBtn != null)
             {
-                if (!ValidateAll())
-                    DialogResult = DialogResult.None;
-            };
+                okBtn.Click += delegate
+                {
+                    if (!ValidateAll())
+                        DialogResult = DialogResult.None;
+                };
+            }
 
             Controls.Add(_grid);
             Controls.Add(addBtn);
@@ -7406,14 +7782,24 @@ namespace MihomoTray
             Controls.Add(delBtn);
             Controls.Add(upBtn);
             Controls.Add(downBtn);
-            Controls.Add(okBtn);
-            Controls.Add(cancelBtn);
+            if (okBtn != null) Controls.Add(okBtn);
+            if (cancelBtn != null) Controls.Add(cancelBtn);
 
-            AcceptButton = okBtn;
-            CancelButton = cancelBtn;
+            if (okBtn != null) AcceptButton = okBtn;
+            if (cancelBtn != null) CancelButton = cancelBtn;
             UiStyles.ApplyControls(this);
             if (_items.Count > 0)
                 SelectRow(0);
+        }
+
+        /// <summary>
+        /// 供嵌入式宿主（ConfigAndSubscriptionForm）调用的校验入口。
+        /// 与独立弹窗的 ValidateAll 行为一致，但用宿主作为 MessageBox 父窗口，
+        /// 否则提示框会飘到子表单上、层级错乱。
+        /// </summary>
+        public bool ValidateForHost()
+        {
+            return ValidateAll(true);
         }
 
         void EditAt(int idx)
@@ -7499,8 +7885,19 @@ namespace MihomoTray
 
         bool ValidateAll()
         {
+            return ValidateAll(false);
+        }
+
+        /// <summary>
+        /// 校验全部订阅项。hostMode=true 时用父窗口作为提示框宿主
+        /// （嵌入式场景下 this 是挂在 TabPage 里的无边框控件，直接当 Owner 会层级错乱）。
+        /// </summary>
+        bool ValidateAll(bool hostMode)
+        {
             var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var seenUrls = new HashSet<string>(StringComparer.Ordinal);
+
+            IWin32Window owner = hostMode ? (IWin32Window)this.ParentForm : this;
 
             for (int i = 0; i < _items.Count; i++)
             {
@@ -7510,26 +7907,26 @@ namespace MihomoTray
 
                 if (item.Name.Length == 0 || item.Url.Length == 0)
                 {
-                    MessageBox.Show(this, "第 " + (i + 1) + " 条订阅的名称或链接为空。",
+                    MessageBox.Show(owner, "第 " + (i + 1) + " 条订阅的名称或链接为空。",
                         "订阅无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return false;
                 }
                 if (item.Url.Length > 0 && !Regex.IsMatch(item.Url, @"^https?://", RegexOptions.IgnoreCase))
                 {
-                    MessageBox.Show(this,
+                    MessageBox.Show(owner,
                         "第 " + (i + 1) + " 条订阅的链接不是有效地址：\r\n" + item.Url,
                         "订阅无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return false;
                 }
                 if (!seenNames.Add(item.Name))
                 {
-                    MessageBox.Show(this, "订阅名称重复：\r\n" + item.Name,
+                    MessageBox.Show(owner, "订阅名称重复：\r\n" + item.Name,
                         "订阅重复", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return false;
                 }
                 if (!seenUrls.Add(item.Url))
                 {
-                    MessageBox.Show(this, "订阅链接重复：\r\n" + item.Name,
+                    MessageBox.Show(owner, "订阅链接重复：\r\n" + item.Name,
                         "订阅重复", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return false;
                 }
@@ -7629,6 +8026,137 @@ namespace MihomoTray
         }
     }
 
+    /// <summary>
+    /// 「编辑配置…」面板：把「配置文件管理」与「订阅源管理」合并到同一窗口的两个标签页。
+    ///
+    /// 用户反馈："配置切换和配置更新订阅管理里面的订阅源是分开的"——
+    /// 原先这两个对话框互相独立，用户得先判断"我要改的是配置还是订阅"，
+    /// 但它们其实是同一件事的两面：配置是"最终生效的 yaml"，订阅是"节点来源"。
+    ///
+    /// 实现方式：复用两个既有对话框的全部逻辑，只把它们的控件挂到 TabPage 上，
+    /// 避免重写一遍校验/增删改逻辑（那才是真正的 bug 来源）。
+    /// 为此把两个既有 Form 改成"可注入父容器"的构造方式：
+    /// 设置 TopLevel=false 后，它们的 Controls 就能直接挂进 TabPage。
+    /// </summary>
+    class ConfigAndSubscriptionForm : Form
+    {
+        TabControl _tabs;
+        ConfigProfileManagerForm _profileForm;
+        SubscriptionManagerForm _subForm;
+
+        public ConfigAndSubscriptionForm(
+            List<ConfigProfile> profiles,
+            string activeConfigPath,
+            string basePath,
+            List<SubscriptionInfo> subs)
+        {
+            Text = "编辑配置";
+            UiStyles.ApplyForm(this);
+            FormBorderStyle = FormBorderStyle.Sizable;
+            StartPosition = FormStartPosition.CenterParent;
+            MinimizeBox = false;
+            MaximizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(740, 520);
+            MinimumSize = new Size(660, 460);
+
+            _profileForm = new ConfigProfileManagerForm(
+                profiles, activeConfigPath, basePath, true);
+            _subForm = new SubscriptionManagerForm(subs, true);
+
+            _tabs = new TabControl();
+            _tabs.Left = 8;
+            _tabs.Top = 8;
+            _tabs.Width = ClientSize.Width - 16;
+            _tabs.Height = ClientSize.Height - 60;
+            _tabs.Anchor = AnchorStyles.Top | AnchorStyles.Bottom
+                | AnchorStyles.Left | AnchorStyles.Right;
+
+            var profilePage = new TabPage("配置文件");
+            var subPage = new TabPage("订阅源");
+
+            // 把子表单作为无边框嵌入控件填充整个 TabPage。
+            _profileForm.TopLevel = false;
+            _profileForm.FormBorderStyle = FormBorderStyle.None;
+            _profileForm.Dock = DockStyle.Fill;
+            profilePage.Controls.Add(_profileForm);
+            _profileForm.Show();
+
+            _subForm.TopLevel = false;
+            _subForm.FormBorderStyle = FormBorderStyle.None;
+            _subForm.Dock = DockStyle.Fill;
+            subPage.Controls.Add(_subForm);
+            _subForm.Show();
+
+            _tabs.TabPages.Add(profilePage);
+            _tabs.TabPages.Add(subPage);
+            Controls.Add(_tabs);
+
+            var okBtn = new Button
+            {
+                Text = "保存",
+                Width = 84,
+                Height = 28,
+                Left = ClientSize.Width - 196,
+                Top = ClientSize.Height - 42,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                DialogResult = DialogResult.OK
+            };
+            var cancelBtn = new Button
+            {
+                Text = "取消",
+                Width = 84,
+                Height = 28,
+                Left = ClientSize.Width - 100,
+                Top = ClientSize.Height - 42,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                DialogResult = DialogResult.Cancel
+            };
+
+            okBtn.Click += delegate
+            {
+                // 两个子表单各自校验；任一失败就阻止关闭，并把焦点切到出问题的那一页，
+                // 否则用户会看到"点了保存却什么都没发生"。
+                bool profileOk = _profileForm.ValidateForHost();
+                if (!profileOk)
+                {
+                    _tabs.SelectedIndex = 0;
+                    DialogResult = DialogResult.None;
+                    return;
+                }
+                bool subOk = _subForm.ValidateForHost();
+                if (!subOk)
+                {
+                    _tabs.SelectedIndex = 1;
+                    DialogResult = DialogResult.None;
+                    return;
+                }
+            };
+
+            Controls.Add(okBtn);
+            Controls.Add(cancelBtn);
+
+            AcceptButton = okBtn;
+            CancelButton = cancelBtn;
+            UiStyles.ApplyControls(this);
+        }
+
+        public List<ConfigProfile> GetProfiles()
+        {
+            return _profileForm.GetProfiles();
+        }
+
+        public string GetActiveConfigPath()
+        {
+            return _profileForm.GetActiveConfigPath();
+        }
+
+        public List<SubscriptionInfo> GetSubscriptions()
+        {
+            return _subForm.GetSubscriptions();
+        }
+    }
+
     class SubscriptionEditForm : Form
     {
         TextBox _nameBox;
@@ -7714,16 +8242,35 @@ namespace MihomoTray
         Label _activeLabel;
 
         public ConfigProfileManagerForm(List<ConfigProfile> items, string activeConfigPath, string basePath)
+            : this(items, activeConfigPath, basePath, false)
+        {
+        }
+
+        /// <summary>
+        /// embedded=true 时构建为"可嵌入宿主"的形态：不做对话框装饰、
+        /// 不添加"确定/取消"按钮（由宿主统一负责），控件按 Dock 填充。
+        /// </summary>
+        public ConfigProfileManagerForm(List<ConfigProfile> items, string activeConfigPath, string basePath, bool embedded)
         {
             Text = "配置切换";
             UiStyles.ApplyForm(this);
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            StartPosition = FormStartPosition.CenterParent;
-            MinimizeBox = false;
-            MaximizeBox = false;
-            ShowInTaskbar = false;
-            Width = 700;
-            Height = 430;
+
+            if (embedded)
+            {
+                FormBorderStyle = FormBorderStyle.None;
+                Dock = DockStyle.Fill;
+                ClientSize = new Size(700, 420);
+            }
+            else
+            {
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                StartPosition = FormStartPosition.CenterParent;
+                MinimizeBox = false;
+                MaximizeBox = false;
+                ShowInTaskbar = false;
+                Width = 700;
+                Height = 430;
+            }
 
             _items = items == null ? new List<ConfigProfile>() : new List<ConfigProfile>(items);
             if (_items.Count == 0)
@@ -7737,14 +8284,23 @@ namespace MihomoTray
             _source = new BindingSource();
             _source.DataSource = _items;
 
-            _activeLabel = new Label { Left = 12, Top = 12, Width = 660, Text = "当前活动配置: " + GetActiveName() };
+            _activeLabel = new Label { Left = 12, Top = 12, Text = "当前活动配置: " + GetActiveName() };
+            if (embedded)
+            {
+                _activeLabel.Width = ClientSize.Width - 24;
+                _activeLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            }
+            else
+            {
+                _activeLabel.Width = 660;
+            }
             Controls.Add(_activeLabel);
 
             _grid = new DataGridView();
             _grid.Left = 12;
             _grid.Top = 36;
-            _grid.Width = 660;
-            _grid.Height = 300;
+            _grid.Width = embedded ? ClientSize.Width - 24 : 660;
+            _grid.Height = embedded ? ClientSize.Height - 92 : 300;
             _grid.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             _grid.AutoGenerateColumns = false;
             _grid.AllowUserToAddRows = false;
@@ -7768,14 +8324,24 @@ namespace MihomoTray
             _grid.Columns.Add(pathCol);
             Controls.Add(_grid);
 
-            var addBtn = new Button { Text = "新增", Left = 12, Top = 346, Width = 72 };
-            var editBtn = new Button { Text = "编辑", Left = 92, Top = 346, Width = 72 };
-            var delBtn = new Button { Text = "删除", Left = 172, Top = 346, Width = 72 };
-            var upBtn = new Button { Text = "上移", Left = 252, Top = 346, Width = 72 };
-            var downBtn = new Button { Text = "下移", Left = 332, Top = 346, Width = 72 };
-            var setActiveBtn = new Button { Text = "设为当前", Left = 412, Top = 346, Width = 88 };
-            var okBtn = new Button { Text = "确定", Left = 520, Top = 346, Width = 72, DialogResult = DialogResult.OK };
-            var cancelBtn = new Button { Text = "取消", Left = 600, Top = 346, Width = 72, DialogResult = DialogResult.Cancel };
+            int pBtnTop = embedded ? ClientSize.Height - 40 : 346;
+            var pBtnAnchor = embedded
+                ? (AnchorStyles.Bottom | AnchorStyles.Left)
+                : AnchorStyles.Top;
+
+            var addBtn = new Button { Text = "新增", Left = 12, Top = pBtnTop, Width = 72, Anchor = pBtnAnchor };
+            var editBtn = new Button { Text = "编辑", Left = 92, Top = pBtnTop, Width = 72, Anchor = pBtnAnchor };
+            var delBtn = new Button { Text = "删除", Left = 172, Top = pBtnTop, Width = 72, Anchor = pBtnAnchor };
+            var upBtn = new Button { Text = "上移", Left = 252, Top = pBtnTop, Width = 72, Anchor = pBtnAnchor };
+            var downBtn = new Button { Text = "下移", Left = 332, Top = pBtnTop, Width = 72, Anchor = pBtnAnchor };
+            var setActiveBtn = new Button { Text = "设为当前", Left = 412, Top = pBtnTop, Width = 88, Anchor = pBtnAnchor };
+            Button okBtn = null;
+            Button cancelBtn = null;
+            if (!embedded)
+            {
+                okBtn = new Button { Text = "确定", Left = 520, Top = pBtnTop, Width = 72, DialogResult = DialogResult.OK };
+                cancelBtn = new Button { Text = "取消", Left = 600, Top = pBtnTop, Width = 72, DialogResult = DialogResult.Cancel };
+            }
 
             addBtn.Click += delegate
             {
@@ -7855,14 +8421,17 @@ namespace MihomoTray
                 UpdateActiveLabel();
             };
 
-            okBtn.Click += delegate
+            if (okBtn != null)
             {
-                if (!ValidateBeforeClose())
+                okBtn.Click += delegate
                 {
-                    DialogResult = DialogResult.None;
-                    return;
-                }
-            };
+                    if (!ValidateBeforeClose())
+                    {
+                        DialogResult = DialogResult.None;
+                        return;
+                    }
+                };
+            }
 
             Controls.Add(addBtn);
             Controls.Add(editBtn);
@@ -7870,13 +8439,22 @@ namespace MihomoTray
             Controls.Add(upBtn);
             Controls.Add(downBtn);
             Controls.Add(setActiveBtn);
-            Controls.Add(okBtn);
-            Controls.Add(cancelBtn);
+            if (okBtn != null) Controls.Add(okBtn);
+            if (cancelBtn != null) Controls.Add(cancelBtn);
 
-            AcceptButton = okBtn;
-            CancelButton = cancelBtn;
+            if (okBtn != null) AcceptButton = okBtn;
+            if (cancelBtn != null) CancelButton = cancelBtn;
             SelectActiveProfile();
             UiStyles.ApplyControls(this);
+        }
+
+        /// <summary>
+        /// 供嵌入式宿主（ConfigAndSubscriptionForm）调用的校验入口。
+        /// 与独立弹窗的 ValidateBeforeClose 行为一致。
+        /// </summary>
+        public bool ValidateForHost()
+        {
+            return ValidateBeforeClose();
         }
 
         int CurrentIndex()

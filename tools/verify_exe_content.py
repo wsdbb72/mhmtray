@@ -187,12 +187,55 @@ print('--- 2c. 本轮新增 UI 文案 ---')
 for s, desc in [
     ('关闭 ProxiFyre（停止服务）', 'ProxiFyre 关闭选项（用户反馈缺失的功能）'),
     ('启动 ProxiFyre 服务', 'ProxiFyre 启动选项'),
-    ('（需管理员）', '非管理员提示'),
     ('ProxiFyre 已关闭 · 按应用代理已失效，流量回归默认路由', '关闭成功提示'),
     ('启动 Mihomo（缺少核心 mihomo.exe）', '首次运行缺核心的明确提示'),
     ('# Mihomo 配置（由 MihomoTray 首次运行自动生成）', '单文件首次运行的骨架配置头'),
 ]:
     check(s, (s in blob) or (s in u8), desc)
+print()
+
+# ── 第三轮（Round 2）新增内容 ──
+print('--- 2d. Round 2 新增符号 ---')
+for s, desc in [
+    ('RunScElevated', '提权执行 sc 命令（自动弹 UAC）'),
+    ('ErrorCancelled', 'ERROR_CANCELLED(1223) 常量'),
+    ('RefreshProfileMenu', '配置切换下拉的动态构建'),
+    ('OnProfileMenuOpening', '配置切换悬停回调'),
+    ('OnSwitchProfile', '配置快捷切换'),
+    ('OnEditConfigAndSubscriptions', '编辑配置入口（配置+订阅合并）'),
+    ('ConfigAndSubscriptionForm', '配置与订阅合并编辑面板'),
+    ('_updateAllSubsItem', '顶层「一键更新订阅」菜单项'),
+    ('LoadSubscriptionsCountCached', '订阅数量廉价读取（菜单路径不读文件）'),
+    ('IsProfileActive', '配置项是否当前活动配置'),
+    ('GetActiveProfileName', '当前活动配置显示名'),
+    ('ValidateForHost', '内嵌子表单的校验入口'),
+]:
+    check(s, (s in u8) or (s in blob), desc)
+print()
+
+print('--- 2e. Round 2 新增 UI 文案 ---')
+for s, desc in [
+    ('配置切换', '顶层菜单标签（提到顶层，右键直接可见）'),
+    ('一键更新订阅', '顶层菜单标签（替代「配置与订阅」子菜单）'),
+    ('编辑配置…', '配置切换下方的编辑入口'),
+    ('（尚未添加配置）', '无配置时的占位'),
+    ('（将请求管理员权限）', '非管理员时的提权说明'),
+    ('已取消：未获得管理员权限，ProxiFyre 仍在运行', '用户取消 UAC 时的提示（区别于失败）'),
+    ('已取消：未获得管理员权限，ProxiFyre 未启动', '用户取消 UAC 时的提示（启动路径）'),
+    ('配置文件', '编辑面板标签页 1'),
+    ('订阅源', '编辑面板标签页 2'),
+]:
+    check(s, (s in blob) or (s in u8), desc)
+print()
+
+print('--- 2f. Round 2 已删除的旧结构 ---')
+for s, desc in [
+    ('配置与订阅', '旧子菜单标签（已被顶层两项替代）'),
+    ('编辑订阅源', '旧 notepad 编辑入口（已并入编辑配置面板）'),
+    ('更新全部订阅', '旧嵌套标签（已提升为顶层「一键更新订阅」）'),
+    ('需管理员）', '旧提示（会让用户以为点不动）'),
+]:
+    check(s, not ((s in u8) or (s in blob)), desc)
 print()
 
 print('--- 3. 旧符号已移除 ---')

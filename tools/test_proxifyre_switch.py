@@ -114,26 +114,33 @@ if body_menu:
     p_all = body_menu.find('_appProxyAllItem')
     check(0 < p_service < p_all,
           '总开关排在「启用全部代理」之前（先服务、后名单）')
-    check('需管理员' in body_menu,
-          '非管理员时菜单文案标注「需管理员」')
+    # Round 2 变更：非管理员不再提示"（需管理员）"——那会让人以为点了没用；
+    # 现在点击会自动弹 UAC，因此文案改为说明"将请求管理员权限"。
+    check('将请求管理员权限' in body_menu,
+          '非管理员时菜单文案说明「将请求管理员权限」（点击会自动弹 UAC）')
+    check('（需管理员）' not in body_menu,
+          '不再使用「需管理员」这种让人以为点不动的旧文案')
 
 # ── 2. 关闭必须真的停服务 ──
 print()
 print('2) 关闭语义（必须真的停服务）')
-body_stop = method_body(code, 'bool StopProxiFyreService(out string error)')
-check(body_stop is not None, '存在 StopProxiFyreService()')
+# Round 2 变更：签名新增 cancelled 出参，用于区分"用户取消 UAC"与"真实失败"。
+body_stop = method_body(code, 'bool StopProxiFyreService(out string error, out bool cancelled)')
+check(body_stop is not None, '存在 StopProxiFyreService(out error, out cancelled)')
 
 if body_stop:
-    check('RunSc("stop " + ProxiFyreServiceName)' in body_stop,
-          '调用 sc stop <服务名>')
+    check('RunScElevated("stop " + ProxiFyreServiceName' in body_stop,
+          '调用 sc stop <服务名>（经提权）')
     check('IsProxiFyreRunning()' in body_stop,
           '停止后校验服务确实不在了')
     check('Thread.Sleep' in body_stop,
           '有轮询等待（sc stop 是异步的，发完请求就返回）')
     check('KillProxiFyreProcesses()' in body_stop,
           '有兜底强杀，保证"关闭"语义真的生效')
-    check('_isAdmin' in body_stop,
-          '非管理员时拒绝并给出原因（不静默失败）')
+    # Round 2 变更：不再用 "_isAdmin 就拒绝"，而是自动提权。
+    # 但仍必须对该情况有明确处理——即用户取消提权时给出可区分的返回。
+    check('cancelled' in body_stop,
+          '用户取消提权时返回 cancelled（不谎报为失败）')
     # 必须与"清名字"区分：停止函数里不应出现写 appNames 的动作
     check('WriteProxiFyreAppNames' not in body_stop,
           '停止服务不改 appNames（与「停用全部代理」语义分离）')
