@@ -22,6 +22,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 EXE = os.path.join(ROOT, 'artifacts', 'ci', 'MihomoTray.exe')
 CS = os.path.join(ROOT, 'mihomo-tray', 'EmbeddedIcons.cs')
+MAIN_CS = os.path.join(ROOT, 'mihomo-tray', 'MihomoTray.cs')
+
+# 主源码（用于"字符串字面量精确边界"类断言，见 2f 节）
+main_src = io.open(MAIN_CS, encoding='utf-8-sig').read() if os.path.isfile(MAIN_CS) else ''
 
 if not os.path.isfile(EXE):
     print('未找到 exe:', EXE)
@@ -229,13 +233,22 @@ for s, desc in [
 print()
 
 print('--- 2f. Round 2 已删除的旧结构 ---')
+# 注意：「配置与订阅」不能直接做子串匹配——新文案
+# "配置与订阅源已更新"天然包含它。因此对这类"是别人子串"的标签，
+# 改用**源码字面量精确边界**断言：不得再出现 "配置与订阅" 这个完整字面量。
+# （这正是本项目的老教训：朴素子串搜索会产生假阳性。）
 for s, desc in [
-    ('配置与订阅', '旧子菜单标签（已被顶层两项替代）'),
     ('编辑订阅源', '旧 notepad 编辑入口（已并入编辑配置面板）'),
     ('更新全部订阅', '旧嵌套标签（已提升为顶层「一键更新订阅」）'),
     ('需管理员）', '旧提示（会让用户以为点不动）'),
+    ('配置与订阅已更新', '旧的保存提示（已被新文案替代）'),
 ]:
     check(s, not ((s in u8) or (s in blob)), desc)
+
+# 独立标签断言：源码里不得再有 "配置与订阅" 作为完整字符串字面量
+# （注释里提到历史结构是允许的——注释不进程序集）
+check('配置与订阅', ('"配置与订阅"' not in main_src),
+      '旧标签不得再作为独立字符串字面量出现')
 print()
 
 print('--- 3. 旧符号已移除 ---')
