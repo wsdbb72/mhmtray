@@ -114,6 +114,7 @@ namespace MihomoTray
         ToolStripMenuItem _subMgrItem;
         ToolStripMenuItem _profileItem;
         ToolStripMenuItem _appProxyMenu;
+        ToolStripMenuItem _appProxyAllItem;
         ToolStripMenuItem _autoStartItem;
         ToolStripMenuItem _runMihomoItem;
         ToolStripMenuItem _panelSettingsItem;
@@ -279,6 +280,9 @@ namespace MihomoTray
             {
                 StartMihomo();
             }
+            // ProxiFyre 依赖本程序的 SOCKS 端口，因此放在 mihomo 之后；
+            // 仅在「已有被代理进程」时拉起，避免空配置时无谓启动服务。
+            EnsureProxiFyreServiceOnStartup();
             ApplySavedSystemProxyMode();
             CheckMihomoStatus();
             RefreshUI();
@@ -516,10 +520,11 @@ namespace MihomoTray
             status.Tag = "caption";
             _appProxyMenu.DropDownItems.Add(status);
 
-            string endpoint = ReadProxiFyreEndpoint();
+            string endpoint = ResolveProxiFyreEndpoint();
             if (!string.IsNullOrEmpty(endpoint))
             {
-                var ep = new ToolStripMenuItem("上游 " + endpoint);
+                var ep = new ToolStripMenuItem("上游 " + endpoint +
+                    (_proxiFyrePortOverride > 0 ? "（已自定义）" : ""));
                 ep.Enabled = false;
                 ep.Image = UiStyles.MenuIcon("empty", false);
                 _appProxyMenu.DropDownItems.Add(ep);
@@ -549,6 +554,15 @@ namespace MihomoTray
 
             _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
 
+            // 一键启停：控制全部游戏进程的按应用代理
+            _appProxyAllItem = new ToolStripMenuItem("启用全部代理", null, OnToggleAllAppProxy);
+            _appProxyAllItem.Image = UiStyles.MenuIcon("appproxy", false);
+            _appProxyAllItem.Checked = names.Count > 0;
+            _appProxyAllItem.Enabled = IsProxiFyreInstalled();
+            _appProxyMenu.DropDownItems.Add(_appProxyAllItem);
+
+            _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
+
             var addItem = new ToolStripMenuItem("添加应用…", null, OnAddAppProxy);
             addItem.Image = UiStyles.MenuIcon("plus", false);
             _appProxyMenu.DropDownItems.Add(addItem);
@@ -556,6 +570,12 @@ namespace MihomoTray
             var manageItem = new ToolStripMenuItem("管理应用列表…", null, OnManageAppProxy);
             manageItem.Image = UiStyles.MenuIcon("list", false);
             _appProxyMenu.DropDownItems.Add(manageItem);
+
+            var portItem = new ToolStripMenuItem(
+                string.Format("设置代理端口…（当前 {0}）", ExtractPort(ResolveProxiFyreEndpoint())),
+                null, OnEditProxiFyrePort);
+            portItem.Image = UiStyles.MenuIcon("edit", false);
+            _appProxyMenu.DropDownItems.Add(portItem);
 
             var restartItem = new ToolStripMenuItem("重启 ProxiFyre 服务", null, OnRestartAppProxy);
             restartItem.Image = UiStyles.MenuIcon("refresh", false);
@@ -569,6 +589,63 @@ namespace MihomoTray
             UiStyles.ApplyMenuItems(_appProxyMenu.DropDown);
         }
 
+        /// <summary>从 "host:port" 中取出端口部分；失败时原样返回。</summary>
+        static string ExtractPort(string endpoint)
+        {
+            if (string.IsNullOrEmpty(endpoint))
+                return "-";
+            int i = endpoint.LastIndexOf(':');
+            return i >= 0 && i < endpoint.Length - 1 ? endpoint.Substring(i + 1) : endpoint;
+        }
+
+        void OnToggleAllAppProxy(object sender, EventArgs e)
+        {
+            bool currentlyOn = ReadProxiFyreAppNames().Count > 0;
+            if (currentlyOn)
+                SetAllGameAppsEnabled(false);
+            else
+                SetAllGameAppsEnabledFromSnapshot();
+        }
+
+        void OnEditProxiFyrePort(object sender, EventArgs e)
+        {
+            string current = ResolveProxiFyreEndpoint();
+            string input = AppProxyEditForm.Prompt(this, "设置上游 SOCKS5 端口",
+                ExtractPort(current));
+            if (string.IsNullOrEmpty(input))
+                return;
+
+            int port;
+            if (!int.TryParse(input.Trim(), out port) || port <= 0 || port > 65535)
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo", "端口无效，应为 1-65535", ToolTipIcon.Error);
+                return;
+            }
+
+            _proxiFyrePortOverride = port;
+            SaveTrayConfig();
+
+            // 立即把新端口写回 ProxiFyre 配置并重启服务
+            string error;
+            if (!WriteProxiFyreAppNames(ReadProxiFyreAppNames(), out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "写入 ProxiFyre 配置失败：" + error, ToolTipIcon.Error);
+                return;
+            }
+            if (!RestartProxiFyreService(out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "端口已保存，但重启 ProxiFyreService 失败：" + error, ToolTipIcon.Warning);
+            }
+            else
+            {
+                _trayIcon.ShowBalloonTip(2000, "Mihomo",
+                    string.Format("上游端口已改为 {0}", port), ToolTipIcon.Info);
+            }
+            RefreshUI();
+        }
+
         void OnAddAppProxy(object sender, EventArgs e)
         {
             string name = AppProxyEditForm.Prompt(this, "添加应用", "");
@@ -579,7 +656,7 @@ namespace MihomoTray
 
         void OnManageAppProxy(object sender, EventArgs e)
         {
-            using (var dlg = new AppProxyManagerForm(ReadProxiFyreAppNames(), ReadProxiFyreEndpoint()))
+            using (var dlg = new AppProxyManagerForm(ReadProxiFyreAppNames(), ResolveProxiFyreEndpoint()))
             {
                 if (dlg.ShowDialog(this) != DialogResult.OK)
                     return;
@@ -3002,8 +3079,33 @@ namespace MihomoTray
             get { return Path.Combine(ProxiFyreDir, "ProxiFyre.exe"); }
         }
 
+        /// <summary>停用按应用代理时的进程名单快照（放在本程序配置目录，避免污染 ProxiFyre 安装目录）。</summary>
+        string ProxiFyreDisabledSnapshotPath
+        {
+            get { return Path.Combine(_basePath, "appproxy-disabled.json"); }
+        }
+
         const string ProxiFyreServiceName = "ProxiFyreService";
         const string ProxiFyreProcessName = "ProxiFyre";
+
+        // 用户指定的上游 SOCKS5 端口。0 表示自动探测本程序配置中的端口。
+        int _proxiFyrePortOverride;
+
+        /// <summary>
+        /// 解析 ProxiFyre 应使用的上游 SOCKS5 端点。
+        /// 优先级：用户显式指定 > 配置文件中已写的端点 > 自动探测本程序端口。
+        /// </summary>
+        string ResolveProxiFyreEndpoint()
+        {
+            if (_proxiFyrePortOverride > 0 && _proxiFyrePortOverride <= 65535)
+                return "127.0.0.1:" + _proxiFyrePortOverride;
+
+            string existing = ReadProxiFyreEndpoint();
+            if (!string.IsNullOrEmpty(existing))
+                return existing;
+
+            return "127.0.0.1:" + ReadSocksPort();
+        }
 
         /// <summary>ProxiFyre 是否已安装到本机。</summary>
         bool IsProxiFyreInstalled()
@@ -3025,6 +3127,115 @@ namespace MihomoTray
             }
             catch { }
             return false;
+        }
+
+        /// <summary>
+        /// 一键启用/停用全部游戏进程的按应用代理。
+        /// 启用 = 把配置中所有该代理的进程名写入 ProxiFyre；停用 = 清空 appNames。
+        /// 停用后 ProxiFyre 不再劫持任何进程，游戏流量回归系统默认路由。
+        /// </summary>
+        void SetAllGameAppsEnabled(bool enable)
+        {
+            var all = ReadProxiFyreAppNames();
+            var target = enable ? all : new List<string>();
+
+            string error;
+            // 记录停用前的名单，便于再次启用时恢复
+            if (!enable && all.Count > 0)
+                SaveProxiFyreDisabledSnapshot(all);
+
+            if (!WriteProxiFyreAppNames(target, out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "写入 ProxiFyre 配置失败：" + error, ToolTipIcon.Error);
+                return;
+            }
+
+            if (!RestartProxiFyreService(out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "配置已保存，但重启 ProxiFyreService 失败：" + error, ToolTipIcon.Warning);
+            }
+            else
+            {
+                _trayIcon.ShowBalloonTip(2000, "Mihomo",
+                    enable
+                        ? string.Format("按应用代理已启用 · {0} 个进程", target.Count)
+                        : "按应用代理已停用（游戏流量回归默认路由）",
+                    ToolTipIcon.Info);
+            }
+            RefreshUI();
+        }
+
+        /// <summary>把停用前的进程名单写入快照文件，供再次启用时恢复。</summary>
+        void SaveProxiFyreDisabledSnapshot(List<string> names)
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.Append("{\r\n  \"appNames\": [\r\n");
+                for (int i = 0; i < names.Count; i++)
+                {
+                    sb.Append("    \"").Append(EscapeJson(names[i])).Append("\"");
+                    if (i < names.Count - 1) sb.Append(",");
+                    sb.Append("\r\n");
+                }
+                sb.Append("  ]\r\n}\r\n");
+                WriteUtf8FileAtomic(ProxiFyreDisabledSnapshotPath, sb.ToString());
+            }
+            catch { }
+        }
+
+        /// <summary>读取停用前的进程名单快照；不存在或为空时返回空列表。</summary>
+        List<string> ReadProxiFyreDisabledSnapshot()
+        {
+            var names = new List<string>();
+            try
+            {
+                if (!File.Exists(ProxiFyreDisabledSnapshotPath))
+                    return names;
+                string json = File.ReadAllText(ProxiFyreDisabledSnapshotPath, Encoding.UTF8);
+                foreach (Match item in Regex.Matches(json, @"""([^""]+)"""))
+                {
+                    string name = item.Groups[1].Value.Trim();
+                    if (name.Length > 0 && name != "appNames" && !names.Contains(name))
+                        names.Add(name);
+                }
+            }
+            catch { }
+            return names;
+        }
+
+        /// <summary>一键启用：优先恢复快照中的名单，快照为空则用配置中现有的名单。</summary>
+        void SetAllGameAppsEnabledFromSnapshot()
+        {
+            var snapshot = ReadProxiFyreDisabledSnapshot();
+            if (snapshot.Count == 0)
+            {
+                // 无快照：说明当前配置里的名单已是被清空前的原名单，直接启用现有内容
+                SetAllGameAppsEnabled(true);
+                return;
+            }
+
+            string error;
+            if (!WriteProxiFyreAppNames(snapshot, out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "写入 ProxiFyre 配置失败：" + error, ToolTipIcon.Error);
+                return;
+            }
+            if (!RestartProxiFyreService(out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "配置已保存，但重启 ProxiFyreService 失败：" + error, ToolTipIcon.Warning);
+            }
+            else
+            {
+                _trayIcon.ShowBalloonTip(2000, "Mihomo",
+                    string.Format("按应用代理已启用 · 恢复 {0} 个进程", snapshot.Count),
+                    ToolTipIcon.Info);
+            }
+            RefreshUI();
         }
 
         /// <summary>本程序当前对外提供的 SOCKS5 端口，供 ProxiFyre 作为上游。</summary>
@@ -3154,9 +3365,7 @@ namespace MihomoTray
                 if (added.Count > 0)
                     result.Add(added);
 
-                string endpoint = ReadProxiFyreEndpoint();
-                if (string.IsNullOrEmpty(endpoint))
-                    endpoint = "127.0.0.1:" + ReadSocksPort();
+                string endpoint = ResolveProxiFyreEndpoint();
 
                 var sb = new StringBuilder();
                 sb.Append("{\r\n");
@@ -3268,6 +3477,65 @@ namespace MihomoTray
                     return false;
                 }
                 return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 托盘启动时按需拉起 ProxiFyre 服务。
+        /// 仅当「ProxiFyre 已安装」且「配置中存在被代理进程」时才尝试启动，
+        /// 避免在用户没有配置按应用代理时无谓地拉起服务。失败保持静默，
+        /// 用户可在托盘菜单里手动重试。
+        /// </summary>
+        void EnsureProxiFyreServiceOnStartup()
+        {
+            try
+            {
+                if (!IsProxiFyreInstalled())
+                    return;
+                if (ReadProxiFyreAppNames().Count == 0)
+                    return;
+                string error;
+                EnsureProxiFyreRunning(out error);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 确保 ProxiFyreService 处于运行状态；已运行则直接返回。
+        /// 供托盘启动时与用户手动调用，避免「配置已写好但服务没开」的静默失效。
+        /// </summary>
+        bool EnsureProxiFyreRunning(out string error)
+        {
+            error = null;
+            if (!IsProxiFyreInstalled())
+            {
+                error = "未检测到 ProxiFyre";
+                return false;
+            }
+            if (IsProxiFyreRunning())
+                return true;
+
+            if (!_isAdmin)
+            {
+                error = "需要管理员权限才能启动 ProxiFyreService";
+                return false;
+            }
+
+            try
+            {
+                string output = RunSc("start " + ProxiFyreServiceName);
+                Thread.Sleep(1500);
+                if (IsProxiFyreRunning())
+                    return true;
+
+                error = string.IsNullOrEmpty(output.Trim())
+                    ? "服务未能启动" : output.Trim();
+                return false;
             }
             catch (Exception ex)
             {
@@ -3748,6 +4016,17 @@ namespace MihomoTray
                     _pendingEnableTunAfterAdmin = pendingTunMatch.Groups[1].Value == "true";
                 }
 
+                var pfPortMatch = Regex.Match(json, @"""proxiFyrePort""\s*:\s*(\d+)");
+                if (pfPortMatch.Success)
+                {
+                    int pfPort;
+                    if (int.TryParse(pfPortMatch.Groups[1].Value, out pfPort) &&
+                        pfPort > 0 && pfPort <= 65535)
+                    {
+                        _proxiFyrePortOverride = pfPort;
+                    }
+                }
+
                 LoadAssetVersions(json);
 
                 var profilesMatch = Regex.Matches(json,
@@ -3824,6 +4103,7 @@ namespace MihomoTray
             sb.Append("  \"lastSystemProxyEnabled\": ").Append(_systemProxyDesired ? "true" : "false").Append(",\r\n");
             sb.Append("  \"systemProxyGuardEnabled\": ").Append(_systemProxyGuardEnabled ? "true" : "false").Append(",\r\n");
             sb.Append("  \"pendingEnableTunAfterAdmin\": ").Append(_pendingEnableTunAfterAdmin ? "true" : "false").Append(",\r\n");
+            sb.Append("  \"proxiFyrePort\": ").Append(_proxiFyrePortOverride).Append(",\r\n");
             AppendAssetVersionsJson(sb);
             sb.Append(",\r\n");
             sb.Append("  \"subscriptions\": [\r\n");
@@ -5542,17 +5822,20 @@ namespace MihomoTray
                 Left = 14,
                 Top = 12,
                 Width = 420,
+                Height = 34,
                 Text = string.IsNullOrEmpty(endpoint)
-                    ? "勾选的进程将被代理（进程名需含 .exe）"
-                    : "勾选的进程将被代理，上游 " + endpoint
+                    ? "勾选的进程将被代理（进程名需含 .exe）\r\n"
+                      + "上游流量由 mihomo 规则 PROCESS-NAME,ProxiFyre.exe 决定出口"
+                    : "勾选的进程将被代理，上游 " + endpoint + "\r\n"
+                      + "上游流量由 mihomo 规则 PROCESS-NAME,ProxiFyre.exe 决定出口"
             };
             Controls.Add(hint);
 
             _list = new CheckedListBox();
             _list.Left = 14;
-            _list.Top = 36;
+            _list.Top = 54;
             _list.Width = 420;
-            _list.Height = 320;
+            _list.Height = 302;
             _list.CheckOnClick = true;
             _list.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             Controls.Add(_list);
