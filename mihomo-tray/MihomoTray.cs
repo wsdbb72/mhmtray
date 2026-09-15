@@ -118,6 +118,18 @@ namespace MihomoTray
         volatile bool _snapshotProxiFyreEndpointAlive;
         /// <summary>快照中的被代理进程名列表；替换引用是原子的，UI 线程只读。</summary>
         volatile List<string> _snapshotProxiFyreAppNames = new List<string>();
+        /// <summary>
+        /// 快照中的当前规则模式。
+        /// 之所以必须放进快照：ResolveCurrentMode() 在核心运行时会调
+        /// ReadCoreMode() -> GET /configs，**这是一次真实的 HTTP 请求**。
+        /// 当 external-controller 端口没人监听时，Windows 需要约 2 秒才能
+        /// 判定连接被拒（实测 2000~2020ms，每次都是），而该方法又被
+        /// 菜单渲染链（ApplySnapshotToMenu -> RefreshModeMenu）同步调用，
+        /// 于是「每次打开菜单都白等 2 秒」。这是菜单依然卡顿的真正原因。
+        /// </summary>
+        volatile string _snapshotMode = ModeRule;
+        /// <summary>快照中的开机自启状态（注册表读，虽便宜但不该在菜单路径上做）。</summary>
+        volatile bool _snapshotAutoStart;
         /// <summary>快照是否已完成首轮填充。未填充时菜单走"加载中"占位，避免显示错误状态。</summary>
         volatile bool _snapshotReady;
         System.Threading.Timer _snapshotTimer;
@@ -125,6 +137,8 @@ namespace MihomoTray
         int _snapshotRefreshBusy;
 
         bool _isAdmin;
+        /// <summary>首次运行且数据目录里没有 mihomo.exe —— 用于给出明确提示而不是静默失败。</summary>
+        bool _firstRunMissingCore;
 
         ToolStripMenuItem _statusItem;
         ToolStripMenuItem _startStopItem;
@@ -140,6 +154,7 @@ namespace MihomoTray
         ToolStripMenuItem _profileItem;
         ToolStripMenuItem _appProxyMenu;
         ToolStripMenuItem _appProxyAllItem;
+        ToolStripMenuItem _appProxyServiceItem;
         ToolStripMenuItem _autoStartItem;
         ToolStripMenuItem _runMihomoItem;
         ToolStripMenuItem _panelSettingsItem;
@@ -271,11 +286,17 @@ namespace MihomoTray
 
         public MainForm()
         {
-            _basePath = AppDomain.CurrentDomain.BaseDirectory;
+            _exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+
+            // 数据目录解析：支持"只下载一个 exe 就能跑"。
+            //   1) 便携优先：exe 同目录已有 config.yaml / tray-config.json，
+            //      说明是完整的绿色目录（也是历史行为），原样沿用，保证向后兼容。
+            //   2) 否则回退到 %LOCALAPPDATA%\MihomoTray\，并在首次运行时初始化，
+            //      让单文件下载后即可启动，不再硬依赖同目录的附属文件。
+            _basePath = ResolveDataDirectory();
             _configPath = Path.Combine(_basePath, "config.yaml");
             _mihomoExePath = Path.Combine(_basePath, "mihomo.exe");
             _trayConfigPath = Path.Combine(_basePath, "tray-config.json");
-            _exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
             _activeConfigPath = _configPath;
 
             _panelHost = "127.0.0.1";
@@ -290,6 +311,10 @@ namespace MihomoTray
             _loadedSystemProxyDesired = false;
 
             _isAdmin = IsAdministrator();
+
+            // 首次运行初始化：把数据目录补齐到"可启动"的最小状态。
+            // 放在 _isAdmin 之后、BuildMenu 之前，确保后续一切都看到一致的文件布局。
+            try { EnsureDataDirectoryInitialized(); } catch { }
 
             this.WindowState = FormWindowState.Minimized;
             this.ShowInTaskbar = false;
@@ -637,7 +662,17 @@ namespace MihomoTray
                 catch { }
             }
 
-            // 4) 一次性发布（先写数据，最后置 Ready，保证 UI 读到的是自洽的一组值）
+            // 4) 当前规则模式。
+            //    这一步在快照线程上做，因为核心运行时它真发一次 GET /configs。
+            //    放进快照后，菜单渲染只是读一个 volatile 字段。
+            string mode = ModeRule;
+            try { mode = ResolveCurrentMode(); } catch { }
+
+            // 5) 开机自启状态（注册表读，放后台免得脏了菜单路径）
+            bool autoStart = false;
+            try { autoStart = IsAutoStartEnabled(); } catch { }
+
+            // 6) 一次性发布（先写数据，最后置 Ready，保证 UI 读到的是自洽的一组值）
             _snapshotMihomoRunning = mihomoRunning;
             _snapshotTunEnabled = tunEnabled;
             _snapshotSystemProxyOn = proxyOn;
@@ -646,6 +681,8 @@ namespace MihomoTray
             _snapshotProxiFyreAppNames = appNames;
             _snapshotProxiFyreEndpoint = endpoint;
             _snapshotProxiFyreEndpointAlive = endpointAlive;
+            _snapshotMode = mode;
+            _snapshotAutoStart = autoStart;
             _snapshotReady = true;
         }
 
@@ -697,6 +734,14 @@ namespace MihomoTray
                 }
             }
 
+            // 首次运行缺少核心：这是"单文件下载后"最可能的第一个障碍，
+            // 必须明说缺什么、放哪里，不能让用户看到"启动失败"却不知所以然。
+            if (_firstRunMissingCore && !running)
+            {
+                _startStopItem.Text = "启动 Mihomo（缺少核心 mihomo.exe）";
+                _startStopItem.Tag = "warn";
+            }
+
             _tunItem.Checked = tunOn;
             _tunItem.Text = tunOn ? "TUN 模式已开启" : "TUN 模式";
             _tunItem.Image = UiStyles.MenuIcon("tun", tunOn);
@@ -727,20 +772,22 @@ namespace MihomoTray
 
             if (_autoStartItem != null)
             {
-                _autoStartItem.Checked = IsAutoStartEnabled();
-                _autoStartItem.Image = UiStyles.MenuIcon("power", _autoStartItem.Checked);
+                _autoStartItem.Checked = _snapshotAutoStart;
+                _autoStartItem.Image = UiStyles.MenuIcon("power", _snapshotAutoStart);
             }
 
             ApplySnapshotToAppProxyMenu();
         }
 
-        /// <summary>用快照渲染规则模式子菜单（避免在 UI 线程再次枚举进程）。</summary>
+        /// <summary>用快照渲染规则模式子菜单（避免在 UI 线程再次枚举进程或发 HTTP）。</summary>
         void RefreshModeMenuFromSnapshot(bool running)
         {
             if (_modeMenu == null)
                 return;
 
-            string mode = ResolveCurrentMode();
+            // 只读快照；绝不在这里调 ResolveCurrentMode()——
+            // 那会在核心运行时发出真实的 GET /configs，端口不通时阻塞约 2 秒。
+            string mode = _snapshotMode ?? ModeRule;
             if (_modeRuleItem != null) _modeRuleItem.Checked = mode == ModeRule;
             if (_modeGlobalItem != null) _modeGlobalItem.Checked = mode == ModeGlobal;
             if (_modeDirectItem != null) _modeDirectItem.Checked = mode == ModeDirect;
@@ -835,6 +882,20 @@ namespace MihomoTray
                     _appProxyMenu.DropDownItems.Add(item);
                 }
             }
+
+            _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
+
+            // 总开关：关闭/启动 ProxiFyre 服务本身。
+            // 用户明确反馈"缺少关闭选项"——原先只有「停用全部代理」（清空名单+重启服务），
+            // 服务仍在运行；这里给出真正把服务停掉的一键开关。
+            _appProxyServiceItem = new ToolStripMenuItem(
+                running ? "关闭 ProxiFyre（停止服务）" : "启动 ProxiFyre 服务",
+                null, OnToggleProxiFyreService);
+            _appProxyServiceItem.Image = UiStyles.MenuIcon(running ? "off" : "on", running);
+            _appProxyServiceItem.Tag = running ? "danger" : null;
+            if (!_isAdmin)
+                _appProxyServiceItem.Text += "（需管理员）";
+            _appProxyMenu.DropDownItems.Add(_appProxyServiceItem);
 
             _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
 
@@ -1704,7 +1765,91 @@ namespace MihomoTray
             conflicts.Add(item);
         }
 
-        // ──── Process Checks ────
+        // ──── 数据目录解析（支持单文件运行）────
+
+        /// <summary>
+        /// 程序数据目录（存放 config.yaml / tray-config.json / profiles / mihomo.exe）。
+        ///
+        /// 目标：**只下载一个 exe 就能运行**。
+        /// 判定顺序：
+        ///   1) exe 同目录已存在 config.yaml 或 tray-config.json
+        ///      → 视为「便携/绿色目录」，直接使用，完全保持历史行为与向后兼容。
+        ///   2) 否则回退到 %LOCALAPPDATA%\MihomoTray\
+        ///      → 单文件放在任意位置（含只读目录、下载文件夹）都能跑起来。
+        /// 之所以还要先判断同目录：老用户已经把 mihomo.exe、配置、订阅都放在
+        /// 一起了，不能因为引入单文件支持就把他们的数据目录悄悄搬走。
+        /// </summary>
+        static string ResolveDataDirectory()
+        {
+            string exeDir = AppDomain.CurrentDomain.BaseDirectory;
+
+            // 1) 便携优先
+            try
+            {
+                if (File.Exists(Path.Combine(exeDir, "config.yaml")) ||
+                    File.Exists(Path.Combine(exeDir, "tray-config.json")))
+                {
+                    return exeDir;
+                }
+            }
+            catch { }
+
+            // 2) 回退到用户数据目录
+            try
+            {
+                string root = Environment.GetFolderPath(
+                    Environment.SpecialFolder.LocalApplicationData);
+                if (!string.IsNullOrEmpty(root))
+                    return Path.Combine(root, "MihomoTray");
+            }
+            catch { }
+
+            // 3) 极端兜底：仍然用 exe 同目录（保持最基本可用性）
+            return exeDir;
+        }
+
+        /// <summary>
+        /// 首次运行时把数据目录补齐到「可启动」的最小状态。
+        /// 幂等：已存在的文件一律不覆盖，避免抹掉用户配置。
+        /// </summary>
+        void EnsureDataDirectoryInitialized()
+        {
+            try { Directory.CreateDirectory(_basePath); } catch { return; }
+
+            // 最小可用配置：给出一个能启动的骨架，并明确标注待用户填写的位置。
+            // 注意不要写"看起来能用但其实连不上"的假配置，否则用户会以为程序坏了。
+            if (!File.Exists(_configPath))
+            {
+                string skeleton =
+                    "# Mihomo 配置（由 MihomoTray 首次运行自动生成）\r\n" +
+                    "#\r\n" +
+                    "# 请任选其一：\r\n" +
+                    "#   1. 用托盘菜单「配置与订阅 → 编辑订阅源」填入订阅链接后更新；\r\n" +
+                    "#   2. 直接替换本文件为你的 mihomo 配置。\r\n" +
+                    "#\r\n" +
+                    "# 另外需要把 mihomo 核心可执行文件放到本目录并命名为 mihomo.exe：\r\n" +
+                    "#   " + _mihomoExePath + "\r\n" +
+                    "\r\n" +
+                    "mixed-port: 7893\r\n" +
+                    "socks-port: 7891\r\n" +
+                    "allow-lan: false\r\n" +
+                    "mode: rule\r\n" +
+                    "log-level: info\r\n" +
+                    "external-controller: 127.0.0.1:9097\r\n" +
+                    "proxy-providers: {}\r\n" +
+                    "proxies: []\r\n" +
+                    "proxy-groups: []\r\n" +
+                    "rules:\r\n" +
+                    "  - MATCH,DIRECT\r\n";
+                WriteUtf8FileAtomic(_configPath, skeleton);
+            }
+
+            // profiles 目录：配置切换器会往里放配置文件
+            try { Directory.CreateDirectory(Path.Combine(_basePath, "profiles")); } catch { }
+
+            _firstRunMissingCore = !File.Exists(_mihomoExePath);
+        }
+
 
         void CheckMihomoStatus()
         {
@@ -3323,6 +3468,13 @@ namespace MihomoTray
             if (string.IsNullOrEmpty(baseUrl))
                 return false;
 
+            // 便宜的预检：先确认端口有人监听，再发 HTTP。
+            // 没有这一步时，端口无人监听会让 Windows 花约 2 秒才判定连接被拒，
+            // 而 TryControllerApi 位于菜单渲染路径上，代价是「每次开菜单卡 2 秒」。
+            // 用 150ms 的连接超时探测：真在监听的端口是回环连接，通常 <1ms 完成。
+            if (!IsLoopbackEndpointReachable(baseUrl))
+                return false;
+
             try
             {
                 var request = (HttpWebRequest)WebRequest.Create(baseUrl + relativePath);
@@ -3628,6 +3780,39 @@ namespace MihomoTray
             }
             catch { return false; }
             finally { try { client.Close(); } catch { } }
+        }
+
+        /// <summary>
+        /// 廉价判断 "http://host:port" 是否值得去发一次真实的 HTTP 请求。
+        ///
+        /// 动机：Windows 对一个"无人监听"的回环端口，判定连接被拒要花约 2 秒
+        /// （实测 9090/9097/7891 均为 2000~2020ms）。HttpWebRequest 的 Timeout
+        /// 设成 4000ms 也没用——拒绝不是超时，而是同步阻塞 2 秒后才返回。
+        /// 由于 TryControllerApi 会被菜单渲染路径间接调用，这 2 秒直接变成
+        /// "每次打开菜单都卡 2 秒"。
+        ///
+        /// 这里用 150ms 的连接探测做闸门：端口真在监听时是回环连接、通常 &lt;1ms 返回，
+        /// 所以正常情况下一分钱都不多花；端口不通时把 2000ms 压到 150ms 上限。
+        /// </summary>
+        static bool IsLoopbackEndpointReachable(string baseUrl)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(baseUrl))
+                    return false;
+
+                var uri = new Uri(baseUrl, UriKind.Absolute);
+                // 只对回环地址做预检：面板/API 本就只应走本机。
+                // 非回环地址（用户自己填了局域网 IP）直接放行，避免误伤。
+                if (!System.Net.IPAddress.TryParse(uri.Host, out var addr) ||
+                    !System.Net.IPAddress.IsLoopback(addr))
+                {
+                    return true;
+                }
+
+                return IsLocalPortListening(uri.Port);
+            }
+            catch { return true; }   // 解析失败时不阻断原路径，保持旧行为
         }
 
         /// <summary>ProxiFyre 是否已安装到本机。</summary>
@@ -4085,6 +4270,102 @@ namespace MihomoTray
                 catch { }
             }
         }
+
+        /// <summary>
+        /// 停止 ProxiFyreService（用户所说的"关闭 ProxiFyre"）。
+        /// 与「停用全部代理」的区别：
+        ///   停用全部代理 = 清空 appNames 后重启服务，服务仍在跑但不再劫持任何进程；
+        ///   停止服务     = 服务本身停掉，ProxiFyre 的 NDIS 过滤驱动卸载，
+        ///                  所有按应用代理规则彻底失效，直到再次启动。
+        /// 两者都让流量回归系统默认路由，但停止服务更彻底（也不占内存/不占驱动）。
+        /// </summary>
+        bool StopProxiFyreService(out string error)
+        {
+            error = null;
+            if (!IsProxiFyreInstalled())
+            {
+                error = "未检测到 ProxiFyre";
+                return false;
+            }
+            if (!_isAdmin)
+            {
+                error = "需要管理员权限才能停止 ProxiFyreService";
+                return false;
+            }
+
+            try
+            {
+                string output = RunSc("stop " + ProxiFyreServiceName);
+                // sc stop 是异步的：发完请求就返回，服务需要一点时间真正退出。
+                // 这里轮询等待，避免"刚点完停止、快照里还是运行中"的观感错位。
+                DateTime deadline = DateTime.UtcNow.AddSeconds(8);
+                while (DateTime.UtcNow < deadline)
+                {
+                    if (!IsProxiFyreRunning())
+                        return true;
+                    Thread.Sleep(250);
+                }
+
+                // 兜底：服务管理器没停下来就强杀进程，保证"关闭"这个语义生效
+                KillProxiFyreProcesses();
+                Thread.Sleep(400);
+
+                if (!IsProxiFyreRunning())
+                    return true;
+
+                error = string.IsNullOrEmpty(output.Trim())
+                    ? "服务未能停止" : output.Trim();
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>ProxiFyre 服务的启停开关（菜单项回调）。</summary>
+        void OnToggleProxiFyreService(object sender, EventArgs e)
+        {
+            string error;
+
+            // 这里刻意**不**用 _snapshotProxiFyreRunning 决定动作：
+            // 快照最多有 SnapshotIntervalMs(3s) 的滞后，用户连续点击时
+            // 很可能读到过期的状态，于是同一个动作被执行两次
+            // （想开变成又想关，或者反之），表现为"点了没反应/越点越乱"。
+            // 启停是低频的用户显式操作，改为现场问一次权威状态，代价可接受。
+            bool running = IsProxiFyreRunning();
+
+            if (running)
+            {
+                if (!StopProxiFyreService(out error))
+                {
+                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                        "停止 ProxiFyre 服务失败：" + error, ToolTipIcon.Error);
+                    RefreshUI();
+                    return;
+                }
+                _trayIcon.ShowBalloonTip(2500, "Mihomo",
+                    "ProxiFyre 已关闭 · 按应用代理已失效，流量回归默认路由",
+                    ToolTipIcon.Info);
+            }
+            else
+            {
+                if (!EnsureProxiFyreRunning(out error))
+                {
+                    _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                        "启动 ProxiFyre 服务失败：" + error, ToolTipIcon.Error);
+                    RefreshUI();
+                    return;
+                }
+                _trayIcon.ShowBalloonTip(2500, "Mihomo",
+                    "ProxiFyre 已启动 · 按应用代理已生效",
+                    ToolTipIcon.Info);
+            }
+
+            RefreshUI();
+        }
+
 
         /// <summary>调用 sc.exe 并返回输出。</summary>
         static string RunSc(string arguments)
@@ -6566,6 +6847,16 @@ namespace MihomoTray
                     case "power":                   // 电源
                         g.DrawArc(pen, 4F, 4.5F, 10F, 10F, -60F, 300F);
                         g.DrawLine(pen, 9F, 3F, 9F, 8F);
+                        break;
+
+                    case "on":                      // 实心圆 + 外圈：打开
+                        g.FillEllipse(brush, 6.5F, 6.5F, 5F, 5F);
+                        g.DrawEllipse(pen, 4F, 4F, 10F, 10F);
+                        break;
+
+                    case "off":                     // 空心圆 + 斜杠：关闭
+                        g.DrawEllipse(pen, 4.5F, 4.5F, 9F, 9F);
+                        g.DrawLine(pen, 5.5F, 12.5F, 12.5F, 5.5F);
                         break;
 
                     case "startup":                 // 火箭/上箭头：启动项
