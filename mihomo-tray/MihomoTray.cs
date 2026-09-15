@@ -3804,7 +3804,12 @@ namespace MihomoTray
                 var uri = new Uri(baseUrl, UriKind.Absolute);
                 // 只对回环地址做预检：面板/API 本就只应走本机。
                 // 非回环地址（用户自己填了局域网 IP）直接放行，避免误伤。
-                if (!System.Net.IPAddress.TryParse(uri.Host, out var addr) ||
+                //
+                // 注意：这里刻意不写 `out var addr`（C# 7.0 内联声明）。
+                // 本项目用 .NET Framework 4.x 自带的旧编译器构建，语言级别是 C# 5，
+                // 内联 out 变量会直接报 CS1026/CS1525。必须用先声明再传出的老写法。
+                System.Net.IPAddress addr;
+                if (!System.Net.IPAddress.TryParse(uri.Host, out addr) ||
                     !System.Net.IPAddress.IsLoopback(addr))
                 {
                     return true;
