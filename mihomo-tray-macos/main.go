@@ -39,6 +39,14 @@ const (
 	runningCacheTTL        = 5 * time.Second
 	proxyStateCacheTTL     = 5 * time.Second
 	networkServiceCacheTTL = 5 * time.Minute
+	controllerAPITimeout   = 4 * time.Second
+)
+
+// 规则模式取值，与 mihomo /configs 接口一致
+const (
+	modeRule   = "rule"
+	modeGlobal = "global"
+	modeDirect = "direct"
 )
 
 var (
@@ -79,6 +87,10 @@ var (
 
 	mStatus     *systray.MenuItem
 	mStartStop  *systray.MenuItem
+	mMode       *systray.MenuItem
+	mModeRule   *systray.MenuItem
+	mModeGlobal *systray.MenuItem
+	mModeDirect *systray.MenuItem
 	mTun        *systray.MenuItem
 	mProxy      *systray.MenuItem
 	mProxyGuard *systray.MenuItem
@@ -94,6 +106,12 @@ var (
 	base64CandidateRe    = regexp.MustCompile(`^[A-Za-z0-9+/]+=*$`)
 	apiMessageRe         = regexp.MustCompile(`"message"\s*:\s*"([^"]+)"`)
 	browserDownloadURLRe = regexp.MustCompile(`"browser_download_url"\s*:\s*"([^"]+)"`)
+
+	// external-controller 支持 ":9090"（仅端口）与 "127.0.0.1:9090" 两种写法
+	externalControllerRe = regexp.MustCompile(`(?m)^external-controller:\s*['"]?([^'"\r\n#]+?)['"]?\s*(?:#.*)?$`)
+	controllerSecretRe   = regexp.MustCompile(`(?m)^secret:\s*['"]?([^'"\r\n#]+?)['"]?\s*(?:#.*)?$`)
+	configModeRe         = regexp.MustCompile(`"mode"\s*:\s*"([^"]+)"`)
+	modeScalarRe         = regexp.MustCompile(`(?m)^mode:\s*['"]?([A-Za-z]+)['"]?\s*(?:#.*)?$`)
 )
 
 var tunConflictTargets = []tunConflictTarget{
@@ -202,6 +220,26 @@ func onReady() {
 	}()
 
 	systray.AddSeparator()
+
+	mMode = systray.AddMenuItem("规则模式", "Switch between rule, global and direct mode")
+	mModeRule = mMode.AddSubMenuItemCheckbox("规则模式", "Follow the routing rules", resolveCurrentMode() == modeRule)
+	mModeGlobal = mMode.AddSubMenuItemCheckbox("全局模式", "Route all traffic through the proxy", resolveCurrentMode() == modeGlobal)
+	mModeDirect = mMode.AddSubMenuItemCheckbox("直连模式", "Bypass the proxy for all traffic", resolveCurrentMode() == modeDirect)
+	go func() {
+		for range mModeRule.ClickedCh {
+			applyMode(modeRule)
+		}
+	}()
+	go func() {
+		for range mModeGlobal.ClickedCh {
+			applyMode(modeGlobal)
+		}
+	}()
+	go func() {
+		for range mModeDirect.ClickedCh {
+			applyMode(modeDirect)
+		}
+	}()
 
 	mTun = systray.AddMenuItemCheckbox("TUN Mode", "Route traffic through mihomo TUN mode", readTunStatus())
 	go func() {
@@ -368,6 +406,8 @@ func refreshUI() {
 		mTun.SetTitle("TUN Mode: Off")
 	}
 
+	refreshModeMenu()
+
 	if systemProxyDesired {
 		mProxy.Check()
 		if proxyOn {
@@ -411,6 +451,248 @@ func rebuildSubMenu(parent *systray.MenuItem) {
 				updateSubscription(s)
 			}
 		}(subs[idx])
+	}
+}
+
+// ──── mihomo External Controller API ────
+// 通过 mihomo 的 RESTful 接口热切换规则模式，避免「改 YAML + 重启核心」导致连接中断。
+
+// parseControllerEndpoint 从配置内容中解析 external-controller，返回可用的 API 基地址与 secret。
+// 支持 ":9090"、"127.0.0.1:9090"、"0.0.0.0:9090" 三种写法；解析失败返回空字符串。
+func parseControllerEndpoint(content string) (baseURL string, secret string) {
+	m := externalControllerRe.FindStringSubmatch(content)
+	if len(m) < 2 {
+		return "", ""
+	}
+	raw := strings.TrimSpace(m[1])
+	if raw == "" {
+		return "", ""
+	}
+	switch {
+	case strings.HasPrefix(raw, ":"):
+		raw = "127.0.0.1" + raw
+	case strings.HasPrefix(raw, "0.0.0.0:"):
+		raw = "127.0.0.1" + strings.TrimPrefix(raw, "0.0.0.0")
+	case strings.HasPrefix(raw, "[::]:"):
+		raw = "127.0.0.1" + strings.TrimPrefix(raw, "[::]")
+	}
+	if !strings.Contains(raw, ":") {
+		return "", ""
+	}
+
+	if sm := controllerSecretRe.FindStringSubmatch(content); len(sm) > 1 {
+		secret = strings.TrimSpace(sm[1])
+	}
+	return "http://" + raw, secret
+}
+
+// resolveControllerEndpoint 读取当前生效配置并解析 API 地址。
+func resolveControllerEndpoint() (string, string) {
+	data, err := readActiveConfig()
+	if err != nil {
+		return "", ""
+	}
+	return parseControllerEndpoint(string(data))
+}
+
+// controllerRequest 调用 mihomo API。method 为 GET / PATCH / PUT。
+func controllerRequest(method, path, body string) ([]byte, error) {
+	baseURL, secret := resolveControllerEndpoint()
+	if baseURL == "" {
+		return nil, fmt.Errorf("external-controller not configured")
+	}
+
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, baseURL+path, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "MihomoTray")
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+
+	// 回环地址直连，禁止再经系统代理
+	client := &http.Client{
+		Timeout:   controllerAPITimeout,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// readCoreMode 读取核心当前生效的规则模式，失败返回空字符串。
+func readCoreMode() string {
+	body, err := controllerRequest("GET", "/configs", "")
+	if err != nil {
+		return ""
+	}
+	m := configModeRe.FindSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return normalizeMode(string(m[1]))
+}
+
+// readConfigFileMode 读取 YAML 中声明的规则模式（核心未运行时的回退来源）。
+func readConfigFileMode() string {
+	data, err := readActiveConfig()
+	if err != nil {
+		return modeRule
+	}
+	m := modeScalarRe.FindSubmatch(data)
+	if len(m) < 2 {
+		return modeRule
+	}
+	return normalizeMode(string(m[1]))
+}
+
+// normalizeMode 规范化模式字符串，未知取值一律回退为 rule。
+func normalizeMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case modeGlobal:
+		return modeGlobal
+	case modeDirect:
+		return modeDirect
+	default:
+		return modeRule
+	}
+}
+
+// resolveCurrentMode 当前生效模式：核心运行中优先取 API，否则回退读配置文件。
+func resolveCurrentMode() string {
+	if isRunning() {
+		if live := readCoreMode(); live != "" {
+			return live
+		}
+	}
+	return readConfigFileMode()
+}
+
+// applyMode 切换规则模式。优先 API 热生效；不可用时降级为改写 YAML 并重启核心。
+func applyMode(mode string) {
+	mode = normalizeMode(mode)
+	running := isRunning()
+
+	if running {
+		payload := fmt.Sprintf(`{"mode":%q}`, mode)
+		if _, err := controllerRequest("PATCH", "/configs", payload); err == nil {
+			writeModeToConfigFile(mode) // 保持冷启动一致
+			refreshUI()
+			notify("规则模式已切换为 " + describeMode(mode))
+			return
+		}
+	}
+
+	if writeModeToConfigFile(mode) {
+		if running {
+			stopMihomo()
+			time.Sleep(500 * time.Millisecond)
+			startMihomo()
+		}
+	} else {
+		notify("切换规则模式失败：配置中未找到 mode 字段，且外部控制接口不可用")
+	}
+	refreshUI()
+}
+
+// writeModeToConfigFile 把 mode 写回配置文件，返回是否写入成功。
+func writeModeToConfigFile(mode string) bool {
+	mode = normalizeMode(mode)
+	path := resolvePath(activeCfgPath)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	var updated string
+	if modeScalarRe.Match(data) {
+		updated = string(modeScalarRe.ReplaceAll(data, []byte("mode: "+mode)))
+	} else {
+		updated = insertTopLevelScalar(string(data), "mode", mode)
+	}
+	if err := os.WriteFile(path, []byte(updated), 0644); err != nil {
+		return false
+	}
+	activeConfigCache = configFileCache{}
+	return true
+}
+
+// insertTopLevelScalar 在顶层插入一个标量配置项（置于文件头部注释之后）。
+func insertTopLevelScalar(content, key, value string) string {
+	if content == "" {
+		return key + ": " + value + "\n"
+	}
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	insertAt := 0
+	for insertAt < len(lines) {
+		trimmed := strings.TrimSpace(lines[insertAt])
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			insertAt++
+			continue
+		}
+		break
+	}
+
+	result := make([]string, 0, len(lines)+1)
+	result = append(result, lines[:insertAt]...)
+	result = append(result, key+": "+value)
+	result = append(result, lines[insertAt:]...)
+	return strings.Join(result, "\n")
+}
+
+// describeMode 返回模式的中文描述。
+func describeMode(mode string) string {
+	switch normalizeMode(mode) {
+	case modeGlobal:
+		return "全局模式"
+	case modeDirect:
+		return "直连模式"
+	default:
+		return "规则模式"
+	}
+}
+
+// refreshModeMenu 同步规则模式子菜单的勾选状态与标题。
+func refreshModeMenu() {
+	if mMode == nil {
+		return
+	}
+
+	mode := resolveCurrentMode()
+	if mode == modeRule {
+		mModeRule.Check()
+	} else {
+		mModeRule.Uncheck()
+	}
+	if mode == modeGlobal {
+		mModeGlobal.Check()
+	} else {
+		mModeGlobal.Uncheck()
+	}
+	if mode == modeDirect {
+		mModeDirect.Check()
+	} else {
+		mModeDirect.Uncheck()
+	}
+
+	if isRunning() {
+		mMode.SetTitle("规则模式：" + describeMode(mode))
+	} else {
+		mMode.SetTitle("规则模式：" + describeMode(mode) + "（未运行）")
 	}
 }
 

@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestParseHTTPPort(t *testing.T) {
 	tests := []struct {
@@ -98,5 +101,144 @@ func TestFindAssetUrl(t *testing.T) {
 	got = findAssetUrl(body, "", "geosite.dat")
 	if got != "https://example.com/geosite.dat" {
 		t.Fatalf("findAssetUrl() = %q", got)
+	}
+}
+
+func TestParseControllerEndpoint(t *testing.T) {
+	tests := []struct {
+		name       string
+		in         string
+		wantURL    string
+		wantSecret string
+	}{
+		{
+			name:    "port only shorthand",
+			in:      "port: 7890\nexternal-controller: :9090\n",
+			wantURL: "http://127.0.0.1:9090",
+		},
+		{
+			name:    "explicit loopback",
+			in:      "external-controller: 127.0.0.1:9090\n",
+			wantURL: "http://127.0.0.1:9090",
+		},
+		{
+			name:    "wildcard listener rewritten to loopback",
+			in:      "external-controller: 0.0.0.0:9091\n",
+			wantURL: "http://127.0.0.1:9091",
+		},
+		{
+			name:       "with secret",
+			in:         "external-controller: :9090\nsecret: my-token\n",
+			wantURL:    "http://127.0.0.1:9090",
+			wantSecret: "my-token",
+		},
+		{
+			name:       "quoted values",
+			in:         "external-controller: \":9092\"\nsecret: \"s3cret\"\n",
+			wantURL:    "http://127.0.0.1:9092",
+			wantSecret: "s3cret",
+		},
+		{
+			name:    "trailing comment ignored",
+			in:      "external-controller: :9090 # panel\n",
+			wantURL: "http://127.0.0.1:9090",
+		},
+		{
+			name:    "missing",
+			in:      "port: 7890\n",
+			wantURL: "",
+		},
+		{
+			name:    "no port",
+			in:      "external-controller: localhost\n",
+			wantURL: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotURL, gotSecret := parseControllerEndpoint(tt.in)
+			if gotURL != tt.wantURL {
+				t.Fatalf("baseURL = %q, want %q", gotURL, tt.wantURL)
+			}
+			if gotSecret != tt.wantSecret {
+				t.Fatalf("secret = %q, want %q", gotSecret, tt.wantSecret)
+			}
+		})
+	}
+}
+
+func TestNormalizeMode(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "rule", want: modeRule},
+		{in: "Global", want: modeGlobal},
+		{in: " DIRECT ", want: modeDirect},
+		{in: "DIRECT", want: modeDirect},
+		{in: "", want: modeRule},
+		{in: "unexpected", want: modeRule},
+	}
+	for _, tt := range tests {
+		if got := normalizeMode(tt.in); got != tt.want {
+			t.Fatalf("normalizeMode(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestConfigModeRegex(t *testing.T) {
+	body := `{"port":7890,"mode":"global","log-level":"info"}`
+	m := configModeRe.FindSubmatch([]byte(body))
+	if len(m) < 2 {
+		t.Fatal("expected mode match")
+	}
+	if got := normalizeMode(string(m[1])); got != modeGlobal {
+		t.Fatalf("mode = %q, want global", got)
+	}
+}
+
+func TestModeScalarReplace(t *testing.T) {
+	cfg := []byte("port: 7890\nmode: rule\nlog-level: info\n")
+	if !modeScalarRe.Match(cfg) {
+		t.Fatal("expected mode match")
+	}
+	updated := modeScalarRe.ReplaceAll(cfg, []byte("mode: "+modeGlobal))
+	want := "port: 7890\nmode: global\nlog-level: info\n"
+	if string(updated) != want {
+		t.Fatalf("updated =\n%s\nwant\n%s", updated, want)
+	}
+}
+
+func TestInsertTopLevelScalar(t *testing.T) {
+	// 无 mode 字段时插入到注释之后
+	in := "# my config\n\nport: 7890\n"
+	got := insertTopLevelScalar(in, "mode", modeDirect)
+	want := "# my config\n\nmode: direct\nport: 7890\n"
+	if got != want {
+		t.Fatalf("insertTopLevelScalar() =\n%q\nwant\n%q", got, want)
+	}
+
+	// 空内容
+	if got := insertTopLevelScalar("", "mode", "rule"); got != "mode: rule\n" {
+		t.Fatalf("empty input = %q", got)
+	}
+}
+
+func TestControllerRequestRejectsMissingEndpoint(t *testing.T) {
+	// 未配置 external-controller 时不应发起请求，直接返回错误
+	prev := activeCfgPath
+	defer func() { activeCfgPath = prev; activeConfigCache = configFileCache{} }()
+
+	dir := t.TempDir()
+	path := dir + "/config.yaml"
+	if err := os.WriteFile(path, []byte("port: 7890\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	activeCfgPath = path
+	activeConfigCache = configFileCache{}
+
+	if _, err := controllerRequest("GET", "/configs", ""); err == nil {
+		t.Fatal("expected error when external-controller is absent")
 	}
 }

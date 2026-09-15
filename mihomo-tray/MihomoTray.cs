@@ -103,6 +103,10 @@ namespace MihomoTray
 
         ToolStripMenuItem _statusItem;
         ToolStripMenuItem _startStopItem;
+        ToolStripMenuItem _modeMenu;
+        ToolStripMenuItem _modeRuleItem;
+        ToolStripMenuItem _modeGlobalItem;
+        ToolStripMenuItem _modeDirectItem;
         ToolStripMenuItem _tunItem;
         ToolStripMenuItem _proxyItem;
         ToolStripMenuItem _proxyGuardItem;
@@ -210,6 +214,23 @@ namespace MihomoTray
         static readonly Regex TunBlockRegex = new Regex(
             @"(?ms)^tun:\s*\r?\n(?<body>(?:^[ \t]+[^\r\n]*(?:\r?\n|$))*)",
             RegexOptions.IgnoreCase);
+
+        // ──── 规则模式（Mode）相关 ────
+        // external-controller 支持两种写法：":9090"（仅端口）与 "127.0.0.1:9090"
+        static readonly Regex ExternalControllerRegex = new Regex(
+            @"(?m)^external-controller:\s*['""]?([^'""\r\n#]+?)['""]?\s*(?:#.*)?$");
+        static readonly Regex ControllerSecretRegex = new Regex(
+            @"(?m)^secret:\s*['""]?([^'""\r\n#]+?)['""]?\s*(?:#.*)?$");
+        // 从 /configs 响应中读取 "mode":"rule"
+        static readonly Regex ConfigModeRegex = new Regex(
+            @"""mode""\s*:\s*""([^""]+)""", RegexOptions.IgnoreCase);
+        static readonly Regex ModeScalarRegex = new Regex(
+            @"(?m)^mode:\s*['""]?([A-Za-z]+)['""]?\s*(?:#.*)?$", RegexOptions.IgnoreCase);
+
+        const string ModeRule = "rule";
+        const string ModeGlobal = "global";
+        const string ModeDirect = "direct";
+        const int ControllerApiTimeoutMilliseconds = 4000;
 
         // ──── Constructor ────
 
@@ -357,6 +378,20 @@ namespace MihomoTray
             _menu.Items.Add(_startStopItem);
 
             _menu.Items.Add(new ToolStripSeparator());
+
+            // 快捷模式切换
+            _modeMenu = new ToolStripMenuItem("规则模式");
+            _modeMenu.Image = UiStyles.MenuIcon("mode", false);
+            _modeRuleItem = new ToolStripMenuItem("规则模式", null,
+                delegate { ApplyMode(ModeRule); });
+            _modeGlobalItem = new ToolStripMenuItem("全局模式", null,
+                delegate { ApplyMode(ModeGlobal); });
+            _modeDirectItem = new ToolStripMenuItem("直连模式", null,
+                delegate { ApplyMode(ModeDirect); });
+            _modeMenu.DropDownItems.Add(_modeRuleItem);
+            _modeMenu.DropDownItems.Add(_modeGlobalItem);
+            _modeMenu.DropDownItems.Add(_modeDirectItem);
+            _menu.Items.Add(_modeMenu);
 
             _tunItem = new ToolStripMenuItem("TUN 模式", null, OnToggleTun);
             _tunItem.Image = UiStyles.MenuIcon("tun", false);
@@ -516,6 +551,8 @@ namespace MihomoTray
             _tunItem.Text = tunOn ? "TUN 模式已开启" : "TUN 模式";
             _tunItem.Image = UiStyles.MenuIcon("tun", tunOn);
 
+            RefreshModeMenu();
+
             _proxyItem.Checked = _systemProxyDesired;
             if (_systemProxyDesired && !proxyOn)
                 _proxyItem.Text = _systemProxyGuardEnabled
@@ -543,6 +580,31 @@ namespace MihomoTray
                 _autoStartItem.Checked = IsAutoStartEnabled();
                 _autoStartItem.Image = UiStyles.MenuIcon("power", _autoStartItem.Checked);
             }
+        }
+
+        /// <summary>同步规则模式子菜单的勾选状态与标题。</summary>
+        void RefreshModeMenu()
+        {
+            if (_modeMenu == null)
+                return;
+
+            string mode = ResolveCurrentMode();
+            bool running = IsMihomoRunning();
+
+            if (_modeRuleItem != null) _modeRuleItem.Checked = mode == ModeRule;
+            if (_modeGlobalItem != null) _modeGlobalItem.Checked = mode == ModeGlobal;
+            if (_modeDirectItem != null) _modeDirectItem.Checked = mode == ModeDirect;
+
+            if (running)
+            {
+                _modeMenu.Text = "规则模式：" + DescribeMode(mode);
+            }
+            else
+            {
+                // 核心未运行，模式仅供参考（来自配置文件）
+                _modeMenu.Text = "规则模式：" + DescribeMode(mode) + "（未运行）";
+            }
+            _modeMenu.Image = UiStyles.MenuIcon("mode", mode != ModeRule);
         }
 
         void InitializeSavedProxyModes()
@@ -2514,6 +2576,269 @@ namespace MihomoTray
             _cachedConfigContent = null;
             _cachedConfigWriteTimeUtc = DateTime.MinValue;
             _cachedConfigLength = 0;
+        }
+
+        // ──── mihomo External Controller API ────
+        // 通过 mihomo 的 RESTful API 热切换规则模式，避免「改 YAML + 重启核心」导致连接中断。
+
+        /// <summary>
+        /// 从当前生效配置中解析 external-controller，返回可用的 API 基地址。
+        /// 支持 ":9090"、"127.0.0.1:9090"、"0.0.0.0:9090" 三种写法。
+        /// 解析失败时返回 null（调用方降级为改写 YAML）。
+        /// </summary>
+        string ResolveControllerBaseUrl(out string secret)
+        {
+            secret = null;
+            try
+            {
+                string content = ReadActiveConfigContent();
+                if (string.IsNullOrEmpty(content))
+                    return null;
+
+                var match = ExternalControllerRegex.Match(content);
+                if (!match.Success)
+                    return null;
+
+                string raw = match.Groups[1].Value.Trim();
+                if (raw.Length == 0)
+                    return null;
+
+                // 仅给出端口（":9090"）时补全为回环地址
+                if (raw.StartsWith(":"))
+                    raw = "127.0.0.1" + raw;
+                // 通配监听地址对客户端无意义，改为回环地址访问
+                else if (raw.StartsWith("0.0.0.0:"))
+                    raw = "127.0.0.1" + raw.Substring("0.0.0.0".Length);
+                else if (raw.StartsWith("[::]:"))
+                    raw = "127.0.0.1" + raw.Substring("[::]".Length);
+
+                if (raw.IndexOf(':') < 0)
+                    return null;
+
+                var secretMatch = ControllerSecretRegex.Match(content);
+                if (secretMatch.Success)
+                {
+                    string s = secretMatch.Groups[1].Value.Trim();
+                    if (s.Length > 0)
+                        secret = s;
+                }
+
+                return "http://" + raw;
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// 调用 mihomo API。method 为 GET / PATCH / PUT；成功时通过 body 返回响应正文。
+        /// </summary>
+        bool TryControllerApi(string method, string relativePath, string requestBody, out string responseBody)
+        {
+            responseBody = null;
+            string secret;
+            string baseUrl = ResolveControllerBaseUrl(out secret);
+            if (string.IsNullOrEmpty(baseUrl))
+                return false;
+
+            try
+            {
+                var request = (HttpWebRequest)WebRequest.Create(baseUrl + relativePath);
+                request.Method = method;
+                request.Timeout = ControllerApiTimeoutMilliseconds;
+                request.ReadWriteTimeout = ControllerApiTimeoutMilliseconds;
+                request.Proxy = null;   // 面板/API 走回环地址，禁止再经系统代理
+                request.KeepAlive = false;
+                request.UserAgent = "MihomoTray";
+                if (!string.IsNullOrEmpty(secret))
+                    request.Headers["Authorization"] = "Bearer " + secret;
+
+                if (!string.IsNullOrEmpty(requestBody))
+                {
+                    byte[] payload = Encoding.UTF8.GetBytes(requestBody);
+                    request.ContentType = "application/json";
+                    request.ContentLength = payload.Length;
+                    using (var stream = request.GetRequestStream())
+                        stream.Write(payload, 0, payload.Length);
+                }
+
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                {
+                    responseBody = reader.ReadToEnd();
+                }
+                return true;
+            }
+            catch
+            {
+                // 核心未运行、未开启 external-controller、或鉴权失败
+                return false;
+            }
+        }
+
+        /// <summary>读取核心当前生效的规则模式（rule / global / direct），失败返回 null。</summary>
+        string ReadCoreMode()
+        {
+            string body;
+            if (!TryControllerApi("GET", "/configs", null, out body) || string.IsNullOrEmpty(body))
+                return null;
+
+            var match = ConfigModeRegex.Match(body);
+            if (!match.Success)
+                return null;
+
+            return NormalizeMode(match.Groups[1].Value);
+        }
+
+        /// <summary>读取 YAML 中声明的规则模式（核心未运行时的回退来源）。</summary>
+        string ReadConfigFileMode()
+        {
+            try
+            {
+                string content = ReadActiveConfigContent();
+                if (string.IsNullOrEmpty(content))
+                    return ModeRule;
+
+                var match = ModeScalarRegex.Match(content);
+                if (!match.Success)
+                    return ModeRule;
+
+                return NormalizeMode(match.Groups[1].Value);
+            }
+            catch { }
+            return ModeRule;
+        }
+
+        /// <summary>规范化模式字符串，未知取值一律回退为 rule。</summary>
+        static string NormalizeMode(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return ModeRule;
+
+            switch (value.Trim().ToLowerInvariant())
+            {
+                case ModeGlobal: return ModeGlobal;
+                case ModeDirect: return ModeDirect;
+                default: return ModeRule;
+            }
+        }
+
+        /// <summary>
+        /// 当前生效模式：核心运行中优先取 API（真实运行态），否则回退读配置文件。
+        /// </summary>
+        string ResolveCurrentMode()
+        {
+            if (IsMihomoRunning())
+            {
+                string live = ReadCoreMode();
+                if (live != null)
+                    return live;
+            }
+            return ReadConfigFileMode();
+        }
+
+        /// <summary>
+        /// 切换规则模式。优先调用 API 热生效（不断开现有连接）；
+        /// API 不可用时降级为改写 YAML 并重启核心。
+        /// </summary>
+        void ApplyMode(string mode)
+        {
+            mode = NormalizeMode(mode);
+            bool running = IsMihomoRunning();
+
+            if (running)
+            {
+                string payload = "{\"mode\":\"" + mode + "\"}";
+                string ignored;
+                if (TryControllerApi("PATCH", "/configs", payload, out ignored))
+                {
+                    WriteModeToConfigFile(mode);   // 保持配置文件与运行态一致，便于下次冷启动
+                    RefreshUI();
+                    _trayIcon.ShowBalloonTip(2000, "Mihomo", "规则模式已切换为 " + DescribeMode(mode), ToolTipIcon.Info);
+                    return;
+                }
+            }
+
+            // 降级路径：改写配置文件后重启核心
+            if (WriteModeToConfigFile(mode))
+            {
+                if (running)
+                {
+                    StopMihomo();
+                    StartMihomo();
+                }
+            }
+            else
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "切换规则模式失败：配置中未找到 mode 字段，且外部控制接口不可用。",
+                    ToolTipIcon.Warning);
+            }
+            RefreshUI();
+        }
+
+        /// <summary>把 mode 写回配置文件，保持冷启动一致。返回是否写入成功。</summary>
+        bool WriteModeToConfigFile(string mode)
+        {
+            try
+            {
+                string configPath = GetActiveConfigPath();
+                if (string.IsNullOrEmpty(configPath) || !File.Exists(configPath))
+                    return false;
+
+                string content = File.ReadAllText(configPath, Encoding.UTF8);
+                if (ModeScalarRegex.IsMatch(content))
+                {
+                    content = ModeScalarRegex.Replace(content, "mode: " + mode);
+                }
+                else
+                {
+                    content = InsertTopLevelScalar(content, "mode", mode);
+                }
+
+                WriteUtf8FileAtomic(configPath, content);
+                UpdateActiveConfigCache(configPath, content);
+                return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>在顶层插入一个标量配置项（置于文件头部，紧跟注释之后）。</summary>
+        static string InsertTopLevelScalar(string content, string key, string value)
+        {
+            if (string.IsNullOrEmpty(content))
+                return key + ": " + value + "\n";
+
+            string[] lines = content.Replace("\r\n", "\n").Split('\n');
+            int insertAt = 0;
+            // 跳过开头的空行与注释行，保持文件原有排版
+            while (insertAt < lines.Length)
+            {
+                string trimmed = lines[insertAt].Trim();
+                if (trimmed.Length == 0 || trimmed.StartsWith("#"))
+                    insertAt++;
+                else
+                    break;
+            }
+
+            var result = new List<string>(lines.Length + 1);
+            for (int i = 0; i < insertAt; i++)
+                result.Add(lines[i]);
+            result.Add(key + ": " + value);
+            for (int i = insertAt; i < lines.Length; i++)
+                result.Add(lines[i]);
+
+            return string.Join("\r\n", result);
+        }
+
+        static string DescribeMode(string mode)
+        {
+            switch (NormalizeMode(mode))
+            {
+                case ModeGlobal: return "全局模式";
+                case ModeDirect: return "直连模式";
+                default: return "规则模式";
+            }
         }
 
         bool ReadTunStatus()
