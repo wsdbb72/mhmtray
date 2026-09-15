@@ -1301,7 +1301,7 @@ namespace MihomoTray
                 _trayIcon.ShowBalloonTip(2000, "Mihomo",
                     activeChanged
                         ? "已切换到：" + Path.GetFileName(_activeConfigPath)
-                        : "配置与订阅已更新",
+                        : "配置与订阅源已更新",
                     ToolTipIcon.Info);
             }
         }
@@ -1995,7 +1995,7 @@ namespace MihomoTray
                     "# Mihomo 配置（由 MihomoTray 首次运行自动生成）\r\n" +
                     "#\r\n" +
                     "# 请任选其一：\r\n" +
-                    "#   1. 用托盘菜单「配置与订阅 → 编辑订阅源」填入订阅链接后更新；\r\n" +
+                    "#   1. 用托盘菜单「配置切换 → 编辑配置… → 订阅源」添加订阅后，「一键更新订阅」；\r\n" +
                     "#   2. 直接替换本文件为你的 mihomo 配置。\r\n" +
                     "#\r\n" +
                     "# 另外需要把 mihomo 核心可执行文件放到本目录并命名为 mihomo.exe：\r\n" +
