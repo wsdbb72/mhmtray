@@ -242,3 +242,69 @@ func TestControllerRequestRejectsMissingEndpoint(t *testing.T) {
 		t.Fatal("expected error when external-controller is absent")
 	}
 }
+
+func TestParseSocksPort(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want int
+	}{
+		{
+			name: "socks-port 优先于 mixed-port 与 port",
+			in:   "port: 7890\nsocks-port: 7891\nmixed-port: 7893\n",
+			want: 7891,
+		},
+		{
+			name: "socks-port 为 0 表示禁用，回退到 mixed-port",
+			in:   "port: 7890\nsocks-port: 0\nmixed-port: 7893\n",
+			want: 7893,
+		},
+		{
+			name: "socks-port 与 mixed-port 都为 0，回退到 port",
+			in:   "port: 7890\nsocks-port: 0\nmixed-port: 0\n",
+			want: 7890,
+		},
+		{
+			name: "只有 mixed-port",
+			in:   "mixed-port: 7897\n",
+			want: 7897,
+		},
+		{
+			name: "缩进的 socks-port 不算顶层，忽略",
+			in:   "tun:/n  socks-port: 7891\nport: 7890\n",
+			want: 7890,
+		},
+		{
+			name: "端口超范围，回退默认值",
+			in:   "socks-port: 70000\n",
+			want: 7890,
+		},
+		{
+			name: "都没有则用 fallback",
+			in:   "allow-lan: true\n",
+			want: 7890,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseSocksPort([]byte(tt.in), 7890); got != tt.want {
+				t.Fatalf("parseSocksPort(%q) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsLocalPortListeningRejectsInvalid(t *testing.T) {
+	for _, p := range []int{0, -1, 70000} {
+		if isLocalPortListening(p) {
+			t.Fatalf("isLocalPortListening(%d) = true, want false", p)
+		}
+	}
+}
+
+func TestIsLocalPortListeningClosedPort(t *testing.T) {
+	// 选一个几乎不可能被占用的高位端口
+	if isLocalPortListening(59173) {
+		t.Skip("port 59173 unexpectedly in use")
+	}
+}

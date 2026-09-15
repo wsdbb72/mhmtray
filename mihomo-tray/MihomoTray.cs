@@ -527,11 +527,24 @@ namespace MihomoTray
             string endpoint = ResolveProxiFyreEndpoint();
             if (!string.IsNullOrEmpty(endpoint))
             {
-                var ep = new ToolStripMenuItem("上游 " + endpoint +
-                    (_proxiFyrePortOverride > 0 ? "（已自定义）" : ""));
-                ep.Enabled = false;
-                ep.Image = UiStyles.MenuIcon("empty", false);
+                int epPort;
+                bool alive = TryExtractPort(endpoint, out epPort) && IsLocalPortListening(epPort);
+                string suffix = _proxiFyrePortOverride > 0 ? "（已自定义）" : "";
+                var ep = new ToolStripMenuItem(
+                    "上游 " + endpoint + suffix + (alive ? " · 可用" : " · 未监听"));
+                // Enabled=false 会被 MenuTextColor 统一改成 MutedText，警示色就丢了；
+                // 因此保持 Enabled=true 但点不动（Tag=caption/warn 让它走弱化配色通道）。
+                ep.Tag = alive ? "caption" : "warn";
+                ep.Image = UiStyles.MenuIcon(alive ? "status-on" : "status-off", alive);
                 _appProxyMenu.DropDownItems.Add(ep);
+
+                // 未监听时给一个一键修正入口，避免用户手算端口
+                if (!alive)
+                {
+                    var probe = new ToolStripMenuItem("自动检测可用端口…", null, OnAutoDetectProxiFyrePort);
+                    probe.Image = UiStyles.MenuIcon("refresh", false);
+                    _appProxyMenu.DropDownItems.Add(probe);
+                }
             }
 
             _appProxyMenu.DropDownItems.Add(new ToolStripSeparator());
@@ -611,6 +624,54 @@ namespace MihomoTray
                 SetAllGameAppsEnabledFromSnapshot();
         }
 
+        /// <summary>
+        /// 自动检测本机正在监听的代理端口，并把它应用为 ProxiFyre 的上游。
+        /// 适用于外部核心（clash-verge-rev / mihomo-party 等）占用端口的场景。
+        /// </summary>
+        void OnAutoDetectProxiFyrePort(object sender, EventArgs e)
+        {
+            var found = new List<int>();
+            foreach (int p in CommonProxyPorts)
+                if (IsLocalPortListening(p))
+                    found.Add(p);
+
+            if (found.Count == 0)
+            {
+                _trayIcon.ShowBalloonTip(4000, "Mihomo",
+                    "未检测到任何正在监听的常见代理端口，" +
+                    "请先启动核心，或手动设置端口。", ToolTipIcon.Warning);
+                return;
+            }
+
+            int picked = found[0];
+            ApplyProxiFyrePort(picked,
+                string.Format("已自动切换到 {0}", picked) +
+                (found.Count > 1 ? "（同时发现：" + string.Join(", ", found.ConvertAll(x => x.ToString()).ToArray()) + "）" : ""));
+        }
+
+        /// <summary>把指定端口写成 ProxiFyre 上游并重启服务。</summary>
+        void ApplyProxiFyrePort(int port, string successMessage)
+        {
+            _proxiFyrePortOverride = port;
+            SaveTrayConfig();
+
+            string error;
+            if (!WriteProxiFyreAppNames(ReadProxiFyreAppNames(), out error))
+            {
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "写入 ProxiFyre 配置失败：" + error, ToolTipIcon.Error);
+                return;
+            }
+
+            if (!RestartProxiFyreService(out error))
+                _trayIcon.ShowBalloonTip(3000, "Mihomo",
+                    "端口已保存，但重启 ProxiFyreService 失败：" + error, ToolTipIcon.Warning);
+            else
+                _trayIcon.ShowBalloonTip(2500, "Mihomo", successMessage, ToolTipIcon.Info);
+
+            RefreshUI();
+        }
+
         void OnEditProxiFyrePort(object sender, EventArgs e)
         {
             string current = ResolveProxiFyreEndpoint();
@@ -626,28 +687,7 @@ namespace MihomoTray
                 return;
             }
 
-            _proxiFyrePortOverride = port;
-            SaveTrayConfig();
-
-            // 立即把新端口写回 ProxiFyre 配置并重启服务
-            string error;
-            if (!WriteProxiFyreAppNames(ReadProxiFyreAppNames(), out error))
-            {
-                _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                    "写入 ProxiFyre 配置失败：" + error, ToolTipIcon.Error);
-                return;
-            }
-            if (!RestartProxiFyreService(out error))
-            {
-                _trayIcon.ShowBalloonTip(3000, "Mihomo",
-                    "端口已保存，但重启 ProxiFyreService 失败：" + error, ToolTipIcon.Warning);
-            }
-            else
-            {
-                _trayIcon.ShowBalloonTip(2000, "Mihomo",
-                    string.Format("上游端口已改为 {0}", port), ToolTipIcon.Info);
-            }
-            RefreshUI();
+            ApplyProxiFyrePort(port, string.Format("上游端口已改为 {0}", port));
         }
 
         void OnAddAppProxy(object sender, EventArgs e)
@@ -3323,18 +3363,69 @@ namespace MihomoTray
 
         /// <summary>
         /// 解析 ProxiFyre 应使用的上游 SOCKS5 端点。
-        /// 优先级：用户显式指定 > 配置文件中已写的端点 > 自动探测本程序端口。
+        /// 优先级：用户显式指定 > ProxiFyre 配置中已写且仍在监听的端点 >
+        ///         本程序配置推断出的端口（若正在监听）> 常见端口探测 > 默认 7890。
+        /// 关键点：必须校验端口"真的在监听"，否则会把 ProxiFyre 指向一个死端口。
         /// </summary>
         string ResolveProxiFyreEndpoint()
         {
             if (_proxiFyrePortOverride > 0 && _proxiFyrePortOverride <= 65535)
                 return "127.0.0.1:" + _proxiFyrePortOverride;
 
+            // ProxiFyre 配置里已经写过的端点：只要还在监听就直接沿用，避免无谓改动
             string existing = ReadProxiFyreEndpoint();
-            if (!string.IsNullOrEmpty(existing))
+            int existingPort;
+            if (!string.IsNullOrEmpty(existing) &&
+                TryExtractPort(existing, out existingPort) &&
+                IsLocalPortListening(existingPort))
                 return existing;
 
-            return "127.0.0.1:" + ReadSocksPort();
+            // 本程序配置推断出的端口，仅当确实在监听时采用
+            int inferred = ReadSocksPort();
+            if (IsLocalPortListening(inferred))
+                return "127.0.0.1:" + inferred;
+
+            // 兜底：探测常见端口（外部核心可能跑在别的端口上）
+            foreach (int candidate in CommonProxyPorts)
+            {
+                if (candidate == inferred) continue;
+                if (IsLocalPortListening(candidate))
+                    return "127.0.0.1:" + candidate;
+            }
+
+            // 都不在监听：仍然返回推断值，交给探测器报错，好过静默指向 7890
+            return "127.0.0.1:" + inferred;
+        }
+
+        /// <summary>常见代理端口，按优先级排列，用于上游端点兜底探测。</summary>
+        static readonly int[] CommonProxyPorts = { 7897, 7890, 7891, 7893, 7899, 1080, 10808, 2080 };
+
+        /// <summary>从 "host:port" 中取出端口号。</summary>
+        static bool TryExtractPort(string endpoint, out int port)
+        {
+            port = 0;
+            if (string.IsNullOrEmpty(endpoint)) return false;
+            int idx = endpoint.LastIndexOf(':');
+            if (idx < 0 || idx + 1 >= endpoint.Length) return false;
+            return int.TryParse(endpoint.Substring(idx + 1).Trim(), out port) &&
+                   port > 0 && port <= 65535;
+        }
+
+        /// <summary>本机 127.0.0.1 的指定端口是否有服务在监听。</summary>
+        static bool IsLocalPortListening(int port)
+        {
+            if (port <= 0 || port > 65535) return false;
+            var client = new System.Net.Sockets.TcpClient();
+            try
+            {
+                var result = client.BeginConnect("127.0.0.1", port, null, null);
+                if (!result.AsyncWaitHandle.WaitOne(120, false))
+                    return false;
+                client.EndConnect(result);
+                return true;
+            }
+            catch { return false; }
+            finally { try { client.Close(); } catch { } }
         }
 
         /// <summary>ProxiFyre 是否已安装到本机。</summary>
@@ -3468,7 +3559,10 @@ namespace MihomoTray
             RefreshUI();
         }
 
-        /// <summary>本程序当前对外提供的 SOCKS5 端口，供 ProxiFyre 作为上游。</summary>
+        /// <summary>
+        /// 本程序配置中对外提供的 SOCKS5 端口，供 ProxiFyre 作为上游。
+        /// 优先级 socks-port > mixed-port > port；值为 0 表示该出入口被禁用，继续向下回退。
+        /// </summary>
         int ReadSocksPort()
         {
             try
@@ -3476,13 +3570,13 @@ namespace MihomoTray
                 string content = ReadActiveConfigContent();
                 if (!string.IsNullOrEmpty(content))
                 {
-                    // 优先 socks-port，其次 mixed-port（mixed 同时承载 socks）
                     foreach (var re in new[] { SocksPortRegex, MixedPortRegex, HttpPortRegex })
                     {
                         var m = re.Match(content);
                         if (m.Success)
                         {
                             int port;
+                            // port == 0 是 mihomo 的"禁用"写法，必须跳过而非返回
                             if (int.TryParse(m.Groups[1].Value, out port) && port > 0 && port <= 65535)
                                 return port;
                         }
@@ -5743,6 +5837,8 @@ namespace MihomoTray
         public static readonly Color HoverBack = Color.FromArgb(229, 243, 255);
         public static readonly Color Danger = Color.FromArgb(229, 57, 53);
         public static readonly Color ActiveGreen = Color.FromArgb(52, 199, 89);
+        /// <summary>警示文字色（如"上游端口未监听"），比 MutedText 更强调但不至于像报错。</summary>
+        public static readonly Color WarnText = Color.FromArgb(198, 120, 22);
         public static readonly Font BaseFont = SystemFonts.MenuFont;
         public static readonly Font TitleFont = new Font(SystemFonts.MenuFont, FontStyle.Bold);
         public static readonly Font CaptionFont = SystemFonts.MenuFont;
@@ -5787,13 +5883,19 @@ namespace MihomoTray
                     AttachTightSubMenu(menuItem);
                 }
 
-                if (IsCaption(item))
+                if (IsCaption(item) || IsWarnItem(item))
                 {
                     item.Padding = new Padding(6, 5, 18, 5);
                     item.Font = CaptionFont;
-                    item.ForeColor = MutedText;
+                    item.ForeColor = IsWarnItem(item) ? WarnText : MutedText;
                 }
             }
+        }
+
+        /// <summary>Tag == "warn"：只读的强调提示行，配色走 WarnText。</summary>
+        public static bool IsWarnItem(ToolStripItem item)
+        {
+            return string.Equals(item.Tag as string, "warn", StringComparison.OrdinalIgnoreCase);
         }
 
         static void PrepareMenuSurface(ToolStrip menu)
@@ -6084,6 +6186,9 @@ namespace MihomoTray
         {
             if (IsDanger(item))
                 return Danger;
+            // Tag == "warn"：强调但不报错的提示行（如上游端口未监听）
+            if (IsWarnItem(item))
+                return WarnText;
             if (!item.Enabled || IsCaption(item))
                 return MutedText;
             return Text;

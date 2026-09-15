@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -107,6 +108,8 @@ var subUpdateMu sync.Mutex
 var (
 	tunStatusRe          = regexp.MustCompile(`(?m)(^tun:\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]+enable:\s*)(true|false)`)
 	httpPortRe           = regexp.MustCompile(`(?m)^port:\s*(\d+)`)
+	socksPortRe          = regexp.MustCompile(`(?m)^socks-port:\s*(\d+)`)
+	mixedPortRe          = regexp.MustCompile(`(?m)^mixed-port:\s*(\d+)`)
 	base64CandidateRe    = regexp.MustCompile(`^[A-Za-z0-9+/]+=*$`)
 	apiMessageRe         = regexp.MustCompile(`"message"\s*:\s*"([^"]+)"`)
 	browserDownloadURLRe = regexp.MustCompile(`"browser_download_url"\s*:\s*"([^"]+)"`)
@@ -894,6 +897,44 @@ func getNetworkService() string {
 func readHTTPPort() int {
 	data, _ := readActiveConfig()
 	return parseHTTPPort(data, 7890)
+}
+
+// readSocksPort 返回配置中对外提供的 SOCKS5 端口，供外部工具作为上游。
+// 优先级 socks-port > mixed-port > port；值为 0 表示该出入口被禁用，继续向下回退。
+func readSocksPort() int {
+	data, _ := readActiveConfig()
+	return parseSocksPort(data, 7890)
+}
+
+func parseSocksPort(data []byte, fallback int) int {
+	for _, re := range []*regexp.Regexp{socksPortRe, mixedPortRe, httpPortRe} {
+		m := re.FindSubmatch(data)
+		if len(m) < 2 {
+			continue
+		}
+		p, err := strconv.Atoi(string(m[1]))
+		// 0 是 mihomo 的"禁用"写法，必须跳过而非返回
+		if err == nil && p > 0 && p <= 65535 {
+			return p
+		}
+	}
+	return fallback
+}
+
+// commonProxyPorts 常见代理端口，按优先级排列，用于上游端点兜底探测。
+var commonProxyPorts = []int{7897, 7890, 7891, 7893, 7899, 1080, 10808, 2080}
+
+// isLocalPortListening 检查 127.0.0.1 的指定端口是否有服务在监听。
+func isLocalPortListening(port int) bool {
+	if port <= 0 || port > 65535 {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 120*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 func readActiveConfig() ([]byte, error) {
